@@ -192,6 +192,8 @@ def get_all_config_params(config_file_path: str):
         ecg_fixed_ch = [name.strip() for name in ecg_fixed_ch.split(',') if name.strip()]
         all_qc_params['ECG'] = dict({
             'drop_bad_ch': ecg_section.getboolean('drop_bad_ch'),
+            'megnet_fallback': ecg_section.getboolean('megnet_fallback', fallback=False),
+            'megnet_indepent': ecg_section.getboolean('megnet_indepent', fallback=False),
             'n_breaks_bursts_allowed_per_10min': ecg_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': ecg_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': ecg_section.getfloat('norm_lvl'),
@@ -204,12 +206,27 @@ def get_all_config_params(config_file_path: str):
         eog_fixed_ch = eog_section.get('fixed_channel_names', '')
         eog_fixed_ch = [name.strip() for name in eog_fixed_ch.split(',') if name.strip()]
         all_qc_params['EOG'] = dict({
+            'megnet_fallback': eog_section.getboolean('megnet_fallback', fallback=False),
+            'megnet_indepent': eog_section.getboolean('megnet_indepent', fallback=False),
             'n_breaks_bursts_allowed_per_10min': eog_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': eog_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': eog_section.getfloat('norm_lvl'),
-            'gaussian_sigma': ecg_section.getint('gaussian_sigma'),
+            'gaussian_sigma': eog_section.getint('gaussian_sigma'),
             'thresh_lvl_peakfinder': eog_section.getfloat('thresh_lvl_peakfinder'),
             'fixed_channel_names': eog_fixed_ch})
+
+        megnet_section = config['MEGNET'] if 'MEGNET' in config else None
+        all_qc_params['MEGNET'] = dict({
+            'megnet_optional_dependency': True if megnet_section is None else megnet_section.getboolean('megnet_optional_dependency', fallback=True),
+            'probability_threshold': 0.0 if megnet_section is None else megnet_section.getfloat('probability_threshold', fallback=0.0),
+            'combine_components': False if megnet_section is None else megnet_section.getboolean('combine_components', fallback=False),
+            'max_components_per_class': 2 if megnet_section is None else megnet_section.getint('max_components_per_class', fallback=2),
+            'save_full_ica_timeseries': False if megnet_section is None else megnet_section.getboolean('save_full_ica_timeseries', fallback=False),
+            'megnet_component_strategy': 'top1' if megnet_section is None else megnet_section.get('megnet_component_strategy', fallback='top1'),
+            'megnet_ecg_class': 2 if megnet_section is None else megnet_section.getint('megnet_ecg_class', fallback=2),
+            'megnet_eog_primary_class': 1 if megnet_section is None else megnet_section.getint('megnet_eog_primary_class', fallback=1),
+            'megnet_eog_secondary_class': 3 if megnet_section is None else megnet_section.getint('megnet_eog_secondary_class', fallback=3),
+        })
 
         head_section = config['Head_movement']
         all_qc_params['Head'] = dict({})

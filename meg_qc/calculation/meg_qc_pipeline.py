@@ -1388,6 +1388,7 @@ def process_one_subject(
                 'ECG',
                 ECG_meg_qc,
                 all_qc_params['ECG'],
+                all_qc_params.get('MEGNET', {}),
                 internal_qc_params['ECG'],
                 raw_cropped,
                 channels,
@@ -1414,6 +1415,7 @@ def process_one_subject(
                 'EOG',
                 EOG_meg_qc,
                 all_qc_params['EOG'],
+                all_qc_params.get('MEGNET', {}),
                 internal_qc_params['EOG'],
                 raw_cropped,
                 channels,
@@ -1597,9 +1599,10 @@ def process_one_subject(
 
                 elif deriv.content_type == 'info':
                     meg_artifact.extension = '.fif'
-                    meg_artifact.content = lambda file_path, cont=deriv.content: mne.io.write_info(
-                        file_path, cont
-                    )
+                    def _info_writer(file_path, cont=deriv.content):
+                        mne.io.write_info(file_path, cont, overwrite=True)
+
+                    meg_artifact.content = _info_writer
                 else:
                     print('___MEGqc___: ', meg_artifact.name)
                     meg_artifact.content = 'dummy text'
