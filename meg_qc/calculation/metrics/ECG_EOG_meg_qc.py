@@ -1,3 +1,4 @@
+import importlib
 import mne
 import numpy as np
 import pandas as pd
@@ -15,10 +16,6 @@ from typing import List, Union, Dict
 from meg_qc.plotting.universal_html_report import simple_metric_basic
 from meg_qc.plotting.universal_plots import QC_derivative, get_tit_and_unit
 from meg_qc.calculation.initial_meg_qc import (chs_dict_to_csv,load_data)
-
-
-_MEGNET_CACHE: Dict[str, dict] = {}
-
 
 def _resample_1d_to_length(signal: np.ndarray, target_len: int) -> np.ndarray:
     """Resample a 1D signal to target length with linear interpolation."""
@@ -80,12 +77,10 @@ def _compose_megnet_signal(ica_ts: np.ndarray, comp_idx: np.ndarray, comp_probs:
     return np.sum(selected * w[:, None], axis=0)
 
 
-def _get_or_compute_megnet_outputs(data_path: str, raw: mne.io.Raw, megnet_params: dict) -> dict:
-    """Run MEGnet once per file/config and cache ECG/EOG synthetic candidates."""
-    cache_src = f"{data_path}|{raw.n_times}|{raw.info.get('sfreq', 0)}|{json.dumps(megnet_params, sort_keys=True, default=str)}"
-    cache_key = hashlib.sha1(cache_src.encode('utf-8')).hexdigest()
-    if cache_key in _MEGNET_CACHE:
-        return _MEGNET_CACHE[cache_key]
+def compute_megnet_outputs_for_file(data_path, megnet_params: dict, raw: Union[mne.io.Raw, None] = None) -> dict:
+    """Run MEGnet once for one file and return ECG/EOG synthetic candidates."""
+    if raw is None:
+        raw, _, _, _ = load_data(data_path)
 
     result = {
         'status': 'unavailable',
@@ -96,11 +91,18 @@ def _get_or_compute_megnet_outputs(data_path: str, raw: mne.io.Raw, megnet_param
 
     try:
         from scipy.io import loadmat
-        from MEGnet.prep_inputs.ICA import main as run_ica_pipeline
-        from MEGnet.easy_megnet.easy_megnet import _classify_ica_with_probabilities
+        # Always import MEGnet from the installed public package.
+        # Project dependency is declared in pyproject.toml as "megnet-neuro".
+        run_ica_pipeline = importlib.import_module("MEGnet.prep_inputs.ICA").main
+        _classify_ica_with_probabilities = importlib.import_module(
+            "MEGnet.easy_megnet.easy_megnet"
+        )._classify_ica_with_probabilities
     except Exception as exc:
-        result['reason'] = f'MEGnet import failed: {exc}'
-        _MEGNET_CACHE[cache_key] = result
+        result['reason'] = (
+            "MEGnet import failed from installed package "
+            "(expected dependency: megnet-neuro): "
+            f"{exc}"
+        )
         return result
 
     try:
@@ -175,7 +177,6 @@ def _get_or_compute_megnet_outputs(data_path: str, raw: mne.io.Raw, megnet_param
             'eog': None,
         }
 
-    _MEGNET_CACHE[cache_key] = result
     return result
 
 
@@ -2406,7 +2407,16 @@ def align_mean_rwave(mean_rwave: np.ndarray, artif_per_ch: List, tmin: float, tm
 
 
 #%%
-def ECG_meg_qc(ecg_params: dict, megnet_params: dict, ecg_params_internal: dict, data_path:str, channels: List, chs_by_lobe_orig: dict, m_or_g_chosen: List):
+def ECG_meg_qc(
+    ecg_params: dict,
+    megnet_params: dict,
+    ecg_params_internal: dict,
+    data_path: str,
+    channels: List,
+    chs_by_lobe_orig: dict,
+    m_or_g_chosen: List,
+    megnet_outputs: Union[Dict, None] = None,
+):
 
     """
     Main ECG function. Calculates average ECG artifact and finds affected channels.
@@ -2458,29 +2468,29 @@ def ECG_meg_qc(ecg_params: dict, megnet_params: dict, ecg_params_internal: dict,
     gaussian_sigma=ecg_params['gaussian_sigma']
     thresh_lvl_peakfinder=ecg_params['thresh_lvl_peakfinder']
     megnet_fallback = bool(ecg_params.get('megnet_fallback', False))
-    megnet_indepent = bool(ecg_params.get('megnet_indepent', False))
+    megnet_independent = bool(ecg_params.get('megnet_independent', False))
 
     ecg_derivs = []
     use_method, ecg_str, ecg_ch_name, ecg_data, event_indexes = get_ECG_data_choose_method(raw, ecg_params)
-    megnet_outputs = None
+    precomputed_megnet_outputs = megnet_outputs
     megnet_ecg = None
 
     def _ensure_megnet_ecg():
-        nonlocal megnet_outputs, megnet_ecg
-        if megnet_outputs is None:
-            megnet_outputs = _get_or_compute_megnet_outputs(data_path=data_path, raw=raw, megnet_params=megnet_params)
-            if megnet_outputs.get('status') == 'ok':
-                megnet_ecg = megnet_outputs.get('ecg')
+        nonlocal precomputed_megnet_outputs, megnet_ecg
+        if precomputed_megnet_outputs is None:
+            return None
+        if megnet_ecg is None and precomputed_megnet_outputs.get('status') == 'ok':
+            megnet_ecg = precomputed_megnet_outputs.get('ecg')
         return megnet_ecg
 
-    if megnet_indepent or use_method == 'no_ecg':
+    if megnet_independent or use_method == 'no_ecg':
         _ensure_megnet_ecg()
 
     if use_method == 'no_ecg':
         if _ensure_megnet_ecg() is None:
             simple_metric_ECG = {'description': ecg_str}
-            if megnet_outputs is not None:
-                ecg_str += '<br><br>MEGnet was requested but unavailable: ' + str(megnet_outputs.get('reason', 'unknown'))
+            if precomputed_megnet_outputs is not None:
+                ecg_str += '<br><br>MEGnet was requested but unavailable: ' + str(precomputed_megnet_outputs.get('reason', 'unknown'))
             print('___MEGqc___: ECG metric skipped — no ECG channel available.')
             return ecg_derivs, simple_metric_ECG, ecg_str, []
         ecg_data, event_indexes, _ = _preprocess_megnet_reference(
@@ -2816,7 +2826,16 @@ def ECG_meg_qc(ecg_params: dict, megnet_params: dict, ecg_params_internal: dict,
 
 
 #%%
-def EOG_meg_qc(eog_params: dict, megnet_params: dict, eog_params_internal: dict, data_path: str, channels: dict, chs_by_lobe_orig: dict, m_or_g_chosen: List):
+def EOG_meg_qc(
+    eog_params: dict,
+    megnet_params: dict,
+    eog_params_internal: dict,
+    data_path: str,
+    channels: dict,
+    chs_by_lobe_orig: dict,
+    m_or_g_chosen: List,
+    megnet_outputs: Union[Dict, None] = None,
+):
 
     """
     Main EOG function. Calculates average EOG artifact and finds affected channels.
@@ -2863,29 +2882,29 @@ def EOG_meg_qc(eog_params: dict, megnet_params: dict, eog_params_internal: dict,
     gaussian_sigma=eog_params['gaussian_sigma']
     thresh_lvl_peakfinder=eog_params['thresh_lvl_peakfinder']
     megnet_fallback = bool(eog_params.get('megnet_fallback', False))
-    megnet_indepent = bool(eog_params.get('megnet_indepent', False))
+    megnet_independent = bool(eog_params.get('megnet_independent', False))
 
     eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw, eog_params)
-    megnet_outputs = None
+    precomputed_megnet_outputs = megnet_outputs
     megnet_eog = None
 
     def _ensure_megnet_eog():
-        nonlocal megnet_outputs, megnet_eog
-        if megnet_outputs is None:
-            megnet_outputs = _get_or_compute_megnet_outputs(data_path=data_path, raw=raw, megnet_params=megnet_params)
-            if megnet_outputs.get('status') == 'ok':
-                megnet_eog = megnet_outputs.get('eog')
+        nonlocal precomputed_megnet_outputs, megnet_eog
+        if precomputed_megnet_outputs is None:
+            return None
+        if megnet_eog is None and precomputed_megnet_outputs.get('status') == 'ok':
+            megnet_eog = precomputed_megnet_outputs.get('eog')
         return megnet_eog
 
-    if megnet_indepent or len(eog_data) == 0:
+    if megnet_independent or len(eog_data) == 0:
         _ensure_megnet_eog()
 
     eog_derivs = []
     if len(eog_data) == 0:
         if _ensure_megnet_eog() is None:
             simple_metric_EOG = {'description': eog_str}
-            if megnet_outputs is not None:
-                eog_str += '<br><br>MEGnet was requested but unavailable: ' + str(megnet_outputs.get('reason', 'unknown'))
+            if precomputed_megnet_outputs is not None:
+                eog_str += '<br><br>MEGnet was requested but unavailable: ' + str(precomputed_megnet_outputs.get('reason', 'unknown'))
             return eog_derivs, simple_metric_EOG, eog_str, []
 
         prep_sig, prep_events, _ = _preprocess_megnet_reference(
