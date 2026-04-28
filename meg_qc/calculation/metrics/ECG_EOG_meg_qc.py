@@ -233,11 +233,43 @@ def _source_from_method(use_method: str) -> str:
     return 'recorded'
 
 
+def _apply_lowpass_to_megnet_reference(signal: np.ndarray, sfreq: float, ref_params: dict, ref_kind: str) -> np.ndarray:
+    """Apply optional low-pass filtering to MEGnet synthetic reference only."""
+    sig = np.asarray(signal, dtype=float).reshape(-1)
+    if sig.size == 0:
+        return sig
+
+    apply_lp = bool(ref_params.get('megnet_lowpass_apply', True))
+    if not apply_lp:
+        return sig
+
+    h_freq = float(ref_params.get('megnet_lowpass_h_freq', 40.0 if ref_kind.upper() == 'ECG' else 20.0))
+    nyquist = float(sfreq) / 2.0
+    if h_freq <= 0 or nyquist <= 0:
+        return sig
+
+    # Keep cutoff inside valid bounds for MNE filter_data.
+    if h_freq >= nyquist:
+        h_freq = max(nyquist - 0.5, nyquist * 0.95)
+    if h_freq <= 0:
+        return sig
+
+    filtered = mne.filter.filter_data(
+        sig[np.newaxis, :],
+        sfreq=float(sfreq),
+        l_freq=None,
+        h_freq=float(h_freq),
+        verbose=False,
+    )
+    return np.asarray(filtered[0], dtype=float)
+
+
 def _preprocess_megnet_reference(signal: np.ndarray, ref_kind: str, sfreq: float, ref_params: dict) -> tuple:
     """Run MEGnet synthetic references through the same per-reference preprocessing used by recorded paths."""
     sig = np.asarray(signal, dtype=float).reshape(-1)
     if sig.size == 0:
         return sig, np.array([], dtype=int), {}
+    sig = _apply_lowpass_to_megnet_reference(sig, sfreq, ref_params, ref_kind)
 
     if ref_kind.upper() == 'ECG':
         eval_dict, peaks = check_3_conditions(

@@ -194,6 +194,8 @@ def get_all_config_params(config_file_path: str):
             'drop_bad_ch': ecg_section.getboolean('drop_bad_ch'),
             'megnet_fallback': ecg_section.getboolean('megnet_fallback', fallback=False),
             'megnet_indepent': ecg_section.getboolean('megnet_indepent', fallback=False),
+            'megnet_lowpass_apply': ecg_section.getboolean('megnet_lowpass_apply', fallback=True),
+            'megnet_lowpass_h_freq': ecg_section.getfloat('megnet_lowpass_h_freq', fallback=40.0),
             'n_breaks_bursts_allowed_per_10min': ecg_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': ecg_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': ecg_section.getfloat('norm_lvl'),
@@ -208,6 +210,8 @@ def get_all_config_params(config_file_path: str):
         all_qc_params['EOG'] = dict({
             'megnet_fallback': eog_section.getboolean('megnet_fallback', fallback=False),
             'megnet_indepent': eog_section.getboolean('megnet_indepent', fallback=False),
+            'megnet_lowpass_apply': eog_section.getboolean('megnet_lowpass_apply', fallback=True),
+            'megnet_lowpass_h_freq': eog_section.getfloat('megnet_lowpass_h_freq', fallback=20.0),
             'n_breaks_bursts_allowed_per_10min': eog_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': eog_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': eog_section.getfloat('norm_lvl'),
