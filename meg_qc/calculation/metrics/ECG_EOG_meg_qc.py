@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import os
-import tempfile
 import hashlib
 import json
 from scipy.signal import find_peaks
@@ -77,7 +76,12 @@ def _compose_megnet_signal(ica_ts: np.ndarray, comp_idx: np.ndarray, comp_probs:
     return np.sum(selected * w[:, None], axis=0)
 
 
-def compute_megnet_outputs_for_file(data_path, megnet_params: dict, raw: Union[mne.io.Raw, None] = None) -> dict:
+def compute_megnet_outputs_for_file(
+    data_path,
+    megnet_params: dict,
+    raw: Union[mne.io.Raw, None] = None,
+    derivatives_root: Union[str, None] = None,
+) -> dict:
     """Run MEGnet once for one file and return ECG/EOG synthetic candidates."""
     if raw is None:
         raw, _, _, _ = load_data(data_path)
@@ -91,11 +95,11 @@ def compute_megnet_outputs_for_file(data_path, megnet_params: dict, raw: Union[m
 
     try:
         from scipy.io import loadmat
-        # Always import MEGnet from the installed public package.
-        # Project dependency is declared in pyproject.toml as "megnet-neuro".
+        # Use MEGnet ICA from installed package and the vendored easy_megnet
+        # wrapper shipped with meg_qc.
         run_ica_pipeline = importlib.import_module("MEGnet.prep_inputs.ICA").main
         _classify_ica_with_probabilities = importlib.import_module(
-            "MEGnet.easy_megnet.easy_megnet"
+            "meg_qc.miscellaneous.easy_megnet.easy_megnet"
         )._classify_ica_with_probabilities
     except Exception as exc:
         result['reason'] = (
@@ -106,7 +110,12 @@ def compute_megnet_outputs_for_file(data_path, megnet_params: dict, raw: Union[m
         return result
 
     try:
-        cache_dir = os.path.join(tempfile.gettempdir(), 'megqc_megnet_cache')
+        # Store MEGnet intermediates under the same profile-scoped .tmp tree
+        # used by the rest of MEGqc so delete_temp_folder() cleans them up.
+        if derivatives_root:
+            cache_dir = os.path.join(os.path.abspath(derivatives_root), '.tmp', 'megnet_cache')
+        else:
+            cache_dir = os.path.join(os.path.abspath(os.getcwd()), '.tmp', 'megnet_cache')
         os.makedirs(cache_dir, exist_ok=True)
         outbasename = f"megqc_{hashlib.sha1(data_path.encode('utf-8')).hexdigest()[:12]}"
 

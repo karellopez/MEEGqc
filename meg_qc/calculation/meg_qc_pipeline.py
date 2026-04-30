@@ -1304,6 +1304,7 @@ def process_one_subject(
                 data_path=raw_cropped,
                 megnet_params=all_qc_params.get('MEGNET', {}),
                 raw=raw_cropped if hasattr(raw_cropped, 'info') else None,
+                derivatives_root=derivatives_root,
             )
 
         # Collects per-metric error dicts for this file; injected into the
