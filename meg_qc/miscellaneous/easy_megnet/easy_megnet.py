@@ -521,6 +521,8 @@ def _classify_ica_with_probabilities(
     import MEGnet
     from MEGnet.megnet_utilities import fPredictChunkAndVoting_parrallel
 
+    megnet_init()  # download model_v2 from HuggingFace if not present
+
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
