@@ -1113,6 +1113,93 @@ def _infer_derivative_channel_type(deriv: QC_derivative) -> str:
     return "ALL"
 
 
+def _infer_metric_source_from_path(path: str) -> str:
+    """Infer whether a metric artifact belongs to MEGqc or MEGnet."""
+    return "MEGnet" if "megnet" in str(path or "").lower() else "MEGqc"
+
+
+def _infer_metric_source_from_tsv(path: str) -> str:
+    """Infer source from TSV content when filename/entity parsing is unreliable."""
+    path_str = str(path or "")
+    if "megnet" in path_str.lower():
+        return "MEGnet"
+    try:
+        df = pd.read_csv(path_str, sep="\t", nrows=3)
+    except Exception:
+        return "MEGqc"
+
+    text_bits: List[str] = []
+    for col in ("signal_source", "recorded_or_reconstructed", "synthetic_component_ids", "synthetic_component_probs"):
+        if col in df.columns:
+            vals = [str(v) for v in df[col].dropna().tolist()[:3]]
+            text_bits.extend(vals)
+    joined = " ".join(text_bits).lower()
+    if "megnet" in joined:
+        return "MEGnet"
+    if "synthetic" in joined:
+        return "MEGnet"
+    return "MEGqc"
+
+
+def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[str]) -> str:
+    """Render MEGnet channel/reference metadata extracted from TSV artifacts."""
+    candidate_paths = [
+        str(p) for p in source_paths
+        if "megnet" in str(p).lower()
+        and f"{str(metric_key).lower()[:-1]}channel_megnet" in os.path.basename(str(p)).lower()
+    ]
+    if not candidate_paths:
+        return ""
+
+    rows: List[str] = []
+    seen_paths = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                first_row = next(reader, None)
+        except Exception:
+            first_row = None
+        if not first_row:
+            continue
+
+        channel_col = next(
+            (col for col in first_row.keys() if str(col).lower().startswith(("ecg", "eog"))),
+            "",
+        )
+        info_pairs = [
+            ("Reference channel", first_row.get(channel_col, channel_col or "-")),
+            ("Source", first_row.get("signal_source") or first_row.get("recorded_or_reconstructed") or "megnet"),
+            ("Component IDs", first_row.get("synthetic_component_ids") or "-"),
+            ("Component probabilities", first_row.get("synthetic_component_probs") or "-"),
+            ("Detected events", first_row.get("n_events") or "-"),
+            ("Events per minute", first_row.get("events_rate_per_min") or "-"),
+            ("Sampling frequency", first_row.get("fs") or "-"),
+        ]
+        body = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(label))}</td>"
+            f"<td><code>{html.escape(str(value))}</code></td>"
+            "</tr>"
+            for label, value in info_pairs
+        )
+        rows.append(
+            "<div class='overview-card'>"
+            "<h4>MEGnet reference info</h4>"
+            "<table>"
+            "<thead><tr><th>Field</th><th>Value</th></tr></thead>"
+            f"<tbody>{body}</tbody>"
+            "</table>"
+            f"<details><summary>Source TSV</summary><ul><li><code>{html.escape(path)}</code></li></ul></details>"
+            "</div>"
+        )
+
+    return "".join(rows)
+
+
 def _build_derivative_plot_tabs(
     *,
     group_id: str,
@@ -1130,6 +1217,47 @@ def _build_derivative_plot_tabs(
         label = clean_base if used_labels[clean_base] == 1 else f"{clean_base} ({used_labels[clean_base]})"
         fig_tabs.append((label, _plot_block_from_derivative(deriv, display_title=label)))
     return _build_subtabs_html(group_id=group_id, tabs=fig_tabs, level=level)
+
+
+def _build_channel_tabs_from_derivatives(
+    *,
+    metric_key: str,
+    run_label: str,
+    group_prefix: str,
+    derivatives: Sequence[QC_derivative],
+) -> str:
+    """Group derivative plots into channel-type subtabs."""
+    ch_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
+    for deriv in derivatives:
+        ch_groups[_infer_derivative_channel_type(deriv)].append(deriv)
+
+    ch_tabs: List[Tuple[str, str]] = []
+    order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
+    for key, label in order:
+        items = ch_groups.get(key, [])
+        if not items:
+            continue
+        ch_tabs.append(
+            (
+                label,
+                _build_derivative_plot_tabs(
+                    group_id=f"{group_prefix}-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{key.lower()}",
+                    metric_key=metric_key,
+                    derivatives=items,
+                    level=4,
+                ),
+            )
+        )
+
+    if not ch_tabs:
+        return "<p>No figures were generated for this source.</p>"
+    if len(ch_tabs) == 1:
+        return ch_tabs[0][1]
+    return _build_subtabs_html(
+        group_id=f"{group_prefix}-chtype-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
+        tabs=ch_tabs,
+        level=3,
+    )
 
 
 def _build_subtabs_html(group_id: str, tabs: Sequence[Tuple[str, str]], *, level: int = 1) -> str:
@@ -1165,6 +1293,7 @@ def _build_metric_run_panel(
     derivatives: Sequence[QC_derivative],
     metric_note: str,
     source_paths: Sequence[str],
+    source_groups: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> str:
     """Build one run-specific panel inside a metric tab."""
     blocks = []
@@ -1197,43 +1326,47 @@ def _build_metric_run_panel(
         )
         blocks.append(f"<details><summary>Machine-readable inputs</summary><ul>{src_items}</ul></details>")
 
-    if derivatives:
-        ch_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
-        for deriv in derivatives:
-            ch_groups[_infer_derivative_channel_type(deriv)].append(deriv)
-
-        # Channel-type organization:
-        # - MAG tab when magnetometer-specific figures exist
-        # - GRAD tab when gradiometer-specific figures exist
-        # - EEG tab when EEG-specific figures exist
-        # - General tab for non-specific figures
-        ch_tabs: List[Tuple[str, str]] = []
-        order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
-        for key, label in order:
-            items = ch_groups.get(key, [])
-            if not items:
+    if source_groups and str(metric_key).lower() in {"ecgs", "eogs"}:
+        source_tabs: List[Tuple[str, str]] = []
+        for source_name in ("MEGqc", "MEGnet"):
+            source_entry = source_groups.get(source_name)
+            if not source_entry:
                 continue
-            ch_tabs.append(
-                (
-                    label,
-                    _build_derivative_plot_tabs(
-                        group_id=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{key.lower()}",
-                        metric_key=metric_key,
-                        derivatives=items,
-                        level=4,
-                    ),
+            source_derivatives = source_entry.get("derivatives", []) or []
+            source_source_paths = source_entry.get("source_paths", []) or []
+            source_blocks: List[str] = []
+            if source_name == "MEGnet":
+                megnet_info_html = _build_megnet_reference_info_html(metric_key, source_source_paths)
+                if megnet_info_html:
+                    source_blocks.append(megnet_info_html)
+            source_blocks.append(
+                _build_channel_tabs_from_derivatives(
+                    metric_key=metric_key,
+                    run_label=run_label,
+                    group_prefix=f"source-{_sanitize_token(source_name.lower())}",
+                    derivatives=source_derivatives,
                 )
             )
-        if len(ch_tabs) > 1:
+            source_tabs.append((source_name, "".join(source_blocks)))
+        if source_tabs:
             blocks.append(
                 _build_subtabs_html(
-                    group_id=f"chtype-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
-                    tabs=ch_tabs,
+                    group_id=f"source-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
+                    tabs=source_tabs,
                     level=3,
                 )
             )
         else:
-            blocks.append(ch_tabs[0][1])
+            blocks.append("<p>No figures were generated for this metric/run combination.</p>")
+    elif derivatives:
+        blocks.append(
+            _build_channel_tabs_from_derivatives(
+                metric_key=metric_key,
+                run_label=run_label,
+                group_prefix="figs",
+                derivatives=derivatives,
+            )
+        )
     else:
         blocks.append("<p>No figures were generated for this metric/run combination.</p>")
 
@@ -1988,6 +2121,7 @@ def _build_subject_report_html(
                         derivatives=entry["derivatives"],
                         metric_note=entry.get("metric_note", ""),
                         source_paths=entry.get("source_paths", []),
+                        source_groups=entry.get("source_groups"),
                     ),
                 )
             )
@@ -2784,6 +2918,68 @@ class Deriv_to_plot:
 from joblib import Parallel, delayed
 
 
+def _augment_with_megnet_metric_files(
+    *,
+    metric: str,
+    tsv_paths: List[str],
+    entities_obj: List[dict],
+    calculated_derivs_folder: str,
+    query_base: Optional[str] = None,
+) -> Tuple[List[str], List[dict]]:
+    """Augment ECG/EOG discovery with direct filesystem matches for MEGnet files.
+
+    ANCPBIDS indexing is strict about entity formatting and may miss files whose
+    desc token is followed by an extra ``_megnet`` token. We therefore add those
+    files directly from disk for plotting/report assembly.
+    """
+    metric_l = str(metric).lower()
+    if metric_l not in {"ecgs", "eogs"}:
+        return tsv_paths, entities_obj
+
+    metric_tokens = {
+        "ecgs": ("ecg",),
+        "eogs": ("eog",),
+    }[metric_l]
+
+    calc_root = Path(calculated_derivs_folder)
+    if not calc_root.is_absolute() and query_base:
+        calc_root = Path(query_base) / calc_root
+    calc_root = calc_root.resolve()
+    if not calc_root.exists():
+        return tsv_paths, entities_obj
+    existing_paths = {str(p) for p in tsv_paths}
+    extra_pairs: List[Tuple[str, dict]] = []
+
+    for path_obj in calc_root.rglob("*.tsv"):
+        name_l = path_obj.name.lower()
+        if "megnet" not in name_l:
+            continue
+        if not any(tok in name_l for tok in metric_tokens):
+            continue
+        path_str = str(path_obj)
+        if path_str in existing_paths:
+            continue
+        existing_paths.add(path_str)
+        extra_pairs.append(
+            (
+                path_str,
+                {
+                    "name": path_obj.name,
+                    "extension": path_obj.suffix,
+                },
+            )
+        )
+
+    if not extra_pairs:
+        return tsv_paths, entities_obj
+
+    merged_pairs = list(zip(tsv_paths, entities_obj)) + extra_pairs
+    merged_pairs.sort(key=lambda pair: os.path.basename(str(pair[0])))
+    merged_paths = [pair[0] for pair in merged_pairs]
+    merged_entities = [pair[1] for pair in merged_pairs]
+    return merged_paths, merged_entities
+
+
 def _write_subject_metric_log(
     *,
     log_folders: List[Path],
@@ -2954,32 +3150,66 @@ def process_subject(
             if not tsv_paths:
                 continue
 
-            try:
-                qc_derivs, report_strings = _build_metric_derivatives(
-                    raw_info_path=raw_info_path,
-                    metric=metric,
-                    tsv_paths=tsv_paths,
-                    report_str_path=report_str_path,
-                    plot_settings=plot_settings,
-                    include_sensor_plots=False,
-                )
-            except Exception as exc:
-                print(
-                    f"___MEGqc___: Failed to build derivatives for "
-                    f"sub-{sub} / {run_label} / {metric}: {exc}"
-                )
-                metric_log.append({
-                    "run": run_label,
-                    "metric": metric,
-                    "status": "ERROR",
-                    "message": str(exc),
-                })
-                continue
-
             section_key = _metric_to_report_section(metric)
             if not section_key:
                 continue
-            derivatives = qc_derivs.get(section_key, [])
+
+            source_groups_payload: Optional[Dict[str, Dict[str, Any]]] = None
+            report_strings: Dict[str, str] = {}
+            derivatives: List[QC_derivative] = []
+
+            is_ecg_eog_metric = str(metric).lower() in {"ecgs", "eogs"}
+            if is_ecg_eog_metric:
+                grouped_paths: Dict[str, List[str]] = defaultdict(list)
+                for path in tsv_paths:
+                    grouped_paths[_infer_metric_source_from_tsv(path)].append(path)
+                source_groups_payload = {}
+                for source_name, source_tsv_paths in grouped_paths.items():
+                    try:
+                        qc_derivs, report_strings = _build_metric_derivatives(
+                            raw_info_path=raw_info_path,
+                            metric=metric,
+                            tsv_paths=source_tsv_paths,
+                            report_str_path=report_str_path,
+                            plot_settings=plot_settings,
+                            include_sensor_plots=False,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"___MEGqc___: Failed to build derivatives for "
+                            f"sub-{sub} / {run_label} / {metric} / {source_name}: {exc}"
+                        )
+                        continue
+                    source_derivatives = qc_derivs.get(section_key, [])
+                    source_groups_payload[source_name] = {
+                        "derivatives": source_derivatives,
+                        "source_paths": source_tsv_paths,
+                    }
+                    derivatives.extend(source_derivatives)
+            else:
+                try:
+                    qc_derivs, report_strings = _build_metric_derivatives(
+                        raw_info_path=raw_info_path,
+                        metric=metric,
+                        tsv_paths=tsv_paths,
+                        report_str_path=report_str_path,
+                        plot_settings=plot_settings,
+                        include_sensor_plots=False,
+                    )
+                except Exception as exc:
+                    print(
+                        f"___MEGqc___: Failed to build derivatives for "
+                        f"sub-{sub} / {run_label} / {metric}: {exc}"
+                    )
+                    metric_log.append({
+                        "run": run_label,
+                        "metric": metric,
+                        "status": "ERROR",
+                        "message": str(exc),
+                    })
+                    continue
+                derivatives = qc_derivs.get(section_key, [])
+
             metric_note = str(report_strings.get(section_key, "") or "")
             if (not derivatives) and (not metric_note):
                 metric_log.append({
@@ -3030,6 +3260,15 @@ def process_subject(
                 if metric_note and metric_note not in existing_entry.get("metric_note", ""):
                     existing_entry["metric_note"] = metric_note + existing_entry.get("metric_note", "")
                 existing_entry["source_paths"] = existing_entry.get("source_paths", []) + tsv_paths
+                if source_groups_payload:
+                    existing_source_groups = existing_entry.setdefault("source_groups", {})
+                    for source_name, source_entry in source_groups_payload.items():
+                        target = existing_source_groups.setdefault(
+                            source_name,
+                            {"derivatives": [], "source_paths": []},
+                        )
+                        target["derivatives"] = source_entry.get("derivatives", []) + target.get("derivatives", [])
+                        target["source_paths"] = target.get("source_paths", []) + source_entry.get("source_paths", [])
             else:
                 metrics_payload[payload_key].append(
                     {
@@ -3037,6 +3276,7 @@ def process_subject(
                         "derivatives": derivatives,
                         "metric_note": metric_note,
                         "source_paths": tsv_paths,
+                        "source_groups": source_groups_payload,
                     }
                 )
 
@@ -3370,9 +3610,9 @@ def make_plots_meg_qc(
                 query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDnoiseEeg',
                                       'PSDwavesMag', 'PSDwavesGrad', 'PSDwavesEeg']
             elif metric == 'ECGs':
-                query_args['desc'] = ['ECGchannel', 'ECGs']
+                query_args['desc'] = ['ECGchannel', 'ECGs', 'ECGchannel_megnet', 'ECGs_megnet']
             elif metric == 'EOGs':
-                query_args['desc'] = ['EOGchannel', 'EOGs']
+                query_args['desc'] = ['EOGchannel', 'EOGs', 'EOGchannel_megnet', 'EOGs_megnet']
             else:
                 query_args['desc'] = [metric]
 
@@ -3394,6 +3634,15 @@ def make_plots_meg_qc(
             query_args['return_type'] = 'object'
             with temporary_dataset_base(query_dataset, query_base):
                 entities_obj = sorted(list(query_dataset.query(**query_args)), key=lambda k: k['name'])
+
+            tsv_paths, entities_obj = _augment_with_megnet_metric_files(
+                metric=metric,
+                tsv_paths=tsvs_to_plot_by_metric[metric],
+                entities_obj=entities_obj,
+                calculated_derivs_folder=calculated_derivs_folder,
+                query_base=query_base,
+            )
+            tsvs_to_plot_by_metric[metric] = tsv_paths
             tsv_entities_by_metric[metric] = entities_obj
 
         # Convert them into a list of Deriv_to_plot objects

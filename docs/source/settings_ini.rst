@@ -92,6 +92,8 @@ Peak-to-peak amplitude auto (based on MNE annotatons) [PTP_auto]
 Heart beat artifacts [ECG]
 --------------------------
 - **drop_bad_ch** (bool) - if True - will drop the bad ECG channel from the data and attempt to reconstruct ECG data on base of magnetometers. If False - will not drop the bad ECG channel and will attempt to calculate ECG events on base of the bad ECG channel. Default: *True*
+- **megnet_lowpass_apply** (bool) - If *True*, apply low-pass filtering to the **MEGnet-generated ECG waveform only**. Recorded/reconstructed ECG preprocessing is unchanged. Default: *True*
+- **megnet_lowpass_h_freq** (int or float) - low-pass cutoff for the **MEGnet-generated ECG waveform only**. Unit: Hz. Default: *40*
 - **n_breaks_bursts_allowed_per_10min** (int) - number of breaks in ECG channel allowed per 10 minutes of recording. (This setting is for ECG channel only, not for any other channels Used to detect a noisy ECG channel). Default: *3*
 - **allowed_range_of_peaks_stds** (float) - the allowed range of peaks in standard deviations. (This setting is for ECG channel only, not for any other channels Used to detect a noisy ECG channel). Defaault: *0.05* (experimentally chosen value). How the setting is used:
     
@@ -110,6 +112,8 @@ Heart beat artifacts [ECG]
 
 Eye movement artifacts [EOG]
 ----------------------------
+- **megnet_lowpass_apply** (bool) - If *True*, apply low-pass filtering to the **MEGnet-generated EOG waveform only**. Recorded EOG preprocessing is unchanged. Default: *True*
+- **megnet_lowpass_h_freq** (int or float) - low-pass cutoff for the **MEGnet-generated EOG waveform only**. Unit: Hz. Default: *20*
 - **n_breaks_bursts_allowed_per_10min** (int) - number of breaks in ECG channel allowed per 10 minutes of recording. (This setting is for EOG channel only, not for any other channels Used to detect a noisy EOG channel). Default: *3*
 - **allowed_range_of_peaks_stds** (float) - the allowed range of peaks in standard deviations. (This setting is for EOG channel only, not for any other channels Used to detect a noisy EOG channel). Default: *0.15* (experimentally chosen value). How the setting is used:
     
