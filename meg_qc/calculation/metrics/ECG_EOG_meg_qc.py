@@ -1,4 +1,3 @@
-import importlib
 import mne
 import numpy as np
 import pandas as pd
@@ -97,10 +96,10 @@ def compute_megnet_outputs_for_file(
         from scipy.io import loadmat
         # Use MEGnet ICA from installed package and the vendored easy_megnet
         # wrapper shipped with meg_qc.
-        run_ica_pipeline = importlib.import_module("MEGnet.prep_inputs.ICA").main
-        _classify_ica_with_probabilities = importlib.import_module(
-            "meg_qc.miscellaneous.easy_megnet.easy_megnet"
-        )._classify_ica_with_probabilities
+        from MEGnet.prep_inputs.ICA import main as run_ica_pipeline
+        from meg_qc.miscellaneous.easy_megnet.easy_megnet import (
+            _classify_ica_with_probabilities,
+        )
     except Exception as exc:
         result['reason'] = (
             "MEGnet import failed from installed package "
@@ -1911,7 +1910,7 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
                 use_method = 'no_ecg'
 
         # _, _, _, ecg_data = mne.preprocessing.find_ecg_events(raw, return_ecg=True)
-        # # here the RECONSTRUCTED ecg data will be outputted (based on magnetometers), and only if u set return_ecg=True and no real ec channel present).
+        # # here the RECONSTRUCTED ecg data will be outputted (based on magnetometers), and only if u set return_ecg=True and no real ecg channel present).
         # ecg_data = ecg_data[0]
 
     if use_method == 'no_ecg':
@@ -1944,7 +1943,13 @@ def get_EOG_data(raw: mne.io.Raw, eog_params: dict):
     raw : mne.io.Raw
         Raw data.
     eog_params : dict
-        Dictionary with EOG parameters originating from config file. If
+        Dictionary with EOG parameters originating from the config file.
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw data.
+    eog_params : dict
+        Dictionary with EOG parameters originating from the config file. If
         ``fixed_channel_names`` is provided, those names are used instead
         of MNE channel-type detection.
     
@@ -2452,7 +2457,7 @@ def ECG_meg_qc(
     simple_metric_ECG : dict
         Dictionary with simple metrics for ECG artifacts to be exported into json file.
     ecg_str : str
-        String with information about ECG channel used in the final report.
+        String with information about the ECG channel used in the final report.
     avg_objects_ecg : List
         List of Avg_artif objects, each of which contains the ECG artifact from one MEG channel.
         
@@ -2531,7 +2536,16 @@ def ECG_meg_qc(
             )
             ecg_ch_name = 'MEGnet_ECG'
             use_method = 'correlation_megnet'
-            ecg_str += '<br><br>Reconstructed ECG failed checks; switching to MEGnet fallback.'
+            n_events = len(event_indexes)
+            minutes_in_data = len(ecg_data) / sfreq / 60 if len(ecg_data) > 0 else 0.001
+            events_rate_per_min = round(n_events / minutes_in_data, 1)
+            n_events_str = '<br><br>ECG events detected: ' + str(n_events) + '<br>Heart beats per minute: ' + str(events_rate_per_min)
+            mean_good, ecg_str_checked, mean_rwave, mean_rwave_time = check_mean_wave(
+                ecg_data, 'ECG', event_indexes, tmin, tmax, sfreq, ecg_params_internal, thresh_lvl_peakfinder
+            )
+            ecg_str += '<br><br>Recorded/reconstructed ECG failed checks; switching to MEGnet fallback.'
+            ecg_str += ecg_str_checked + n_events_str
+
         else:
             # data was reconstricted and is bad - dont continue
             simple_metric_ECG = {'description': ecg_str}
@@ -2547,7 +2561,7 @@ def ECG_meg_qc(
                 source_label=_source_from_method(use_method),
             )
 
-            ecg_derivs += [QC_derivative(content=ecg_ch_df, name='ECGchannel', content_type='df')]
+            ecg_derivs += [QC_derivative(content=ecg_ch_df, name='ECGchannel', content_type = 'df')]
             return ecg_derivs, simple_metric_ECG, ecg_str, []
 
     n_events = len(event_indexes)
@@ -2871,7 +2885,7 @@ def EOG_meg_qc(
     simple_metric_EOG : dict
         Dictionary with simple metrics for ECG artifacts to be exported into json file.
     eog_str : str
-        String with information about EOG channel used in the final report.
+        String with information about the EOG channel used in the final report.
     avg_objects_eog : List
         List of Avg_artif objects, each of which contains the EOG artifact from one MEG channel.
     
@@ -3047,7 +3061,7 @@ def EOG_meg_qc(
             artif_per_ch, artif_time_vector = flip_channels(artif_per_ch, tmin, tmax, sfreq, eog_params_internal)
             affected_channels[m_or_g], affected_derivs, bad_avg_str[m_or_g], avg_overall_obj = find_affected_over_mean(artif_per_ch, 'EOG', eog_params_internal, thresh_lvl_peakfinder, m_or_g=m_or_g, norm_lvl=norm_lvl, flip_data=True, gaussian_sigma=gaussian_sigma, artif_time_vector=artif_time_vector)
             best_affected_channels[m_or_g] = copy.deepcopy(affected_channels[m_or_g])
-            correlation_derivs = []
+
 
         elif use_method in ('correlation_recorded', 'correlation_reconstructed', 'correlation_megnet'):
 
