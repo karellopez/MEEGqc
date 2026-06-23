@@ -643,6 +643,14 @@ class SettingsEditorDialog(QDialog):
         ("Filtering", "downsample_to_hz"),
     }
 
+    # Parameters that are conceptually decimal but ship a whole-number default, so the
+    # value-sniffing logic below would otherwise render them as an integer-only spin
+    # box and block the decimal point. Listing a key here forces a decimal spin box.
+    # epoch_tmax defaults to 1 yet represents a time in seconds (e.g. 1.5).
+    _FLOAT_KEYS = {
+        ("Epoching", "epoch_tmax"),
+    }
+
     def __init__(self, source_path: Union[str, Path], defaults_path: Union[str, Path], title: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -874,16 +882,20 @@ class SettingsEditorDialog(QDialog):
             line.setMaximumWidth(215)
             return line, "text"
 
-        try:
-            ival = int(val)
-            spin = QSpinBox()
-            spin.setRange(-1_000_000_000, 1_000_000_000)
-            spin.setValue(ival)
-            spin.setMinimumWidth(145)
-            spin.setMaximumWidth(215)
-            return spin, "int"
-        except Exception:
-            pass
+        # Force a decimal spin box for keys that represent a fractional quantity but
+        # ship a whole-number default (e.g. epoch_tmax = 1). Skipping the integer
+        # branch is what lets the user type a decimal point.
+        if sec_key not in self._FLOAT_KEYS:
+            try:
+                ival = int(val)
+                spin = QSpinBox()
+                spin.setRange(-1_000_000_000, 1_000_000_000)
+                spin.setValue(ival)
+                spin.setMinimumWidth(145)
+                spin.setMaximumWidth(215)
+                return spin, "int"
+            except Exception:
+                pass
 
         try:
             fval = float(val)
