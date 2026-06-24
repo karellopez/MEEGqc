@@ -1837,9 +1837,9 @@ def _build_multi_sample_report_html(
     <section>
       <div class=\"report-header\">
         <div>
-          <h1>QA multi-sample report</h1>
+          <h1>MEEGqc QA multi-sample report</h1>
           <p><strong>Generated:</strong> {generated}</p>
-          <p><strong>MEGqc version:</strong> {version}</p>
+          <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Datasets:</strong> {sample_names}</p>
           <p><strong>Important:</strong> This report mirrors the group QA structure while comparing multiple datasets within each channel-type tab.</p>
         </div>

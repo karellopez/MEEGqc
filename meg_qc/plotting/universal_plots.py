@@ -11,6 +11,7 @@ from typing import List
 import matplotlib.pyplot as plt
 from mne.preprocessing import compute_average_dev_head_t
 from meg_qc.calculation.objects import QC_derivative, MEG_channel
+from meg_qc.plotting.topomap_2d import make_flat_topomap_figure, make_flat_sensor_figure, BLUE_RED_COLORSCALE, COLORMAP_OPTIONS
 import matplotlib #this is in case we will need to suppress mne matplotlib plots
 
 
@@ -93,6 +94,30 @@ def _add_solid_cap_toggle_to_3d_figure(fig: go.Figure, x_vals, y_vals, z_vals) -
             ],
         )
     )
+    fig.update_layout(updatemenus=menus)
+
+
+def _add_colormap_menu_3d(fig: go.Figure, trace_idx: int = 0) -> None:
+    """Add a colour-map dropdown to a 3D topomap (same options as the 2D maps).
+
+    Default convention: high values red, low values blue (RdBu reversed).
+    """
+    # ``marker.colorscale`` is array-valued, so for a single-trace restyle the
+    # value must be wrapped in a list — otherwise Plotly reads the colour stops
+    # as per-trace values and the option (e.g. Red-Blue) never re-applies.
+    buttons = [
+        dict(label=lab, method="restyle",
+             args=[{"marker.colorscale": [cs], "marker.reversescale": [False]}, [trace_idx]])
+        for lab, cs in COLORMAP_OPTIONS
+    ]
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    # ``name`` becomes the control title in the report's external control panel.
+    menus.append(dict(
+        type="dropdown", name="Colour map", direction="down", x=0.42, y=1.03,
+        xanchor="left", yanchor="top", showactive=True, bgcolor="#F7FBFF",
+        bordercolor="#2B6CB0", borderwidth=1.0, font=dict(size=11, color="#0F3D6E"),
+        pad=dict(r=2, t=2, l=2, b=2), buttons=buttons,
+    ))
     fig.update_layout(updatemenus=menus)
 
 
@@ -1828,18 +1853,31 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     return fig_deriv
 
 
-def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
+def plot_2d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: str):
 
     """
-    
-    Plot STD using mne.viz.plot_topomap(data, pos, *, ch_type='mag', sensors=True, names=None) 
-    
-    For every channel we take STD/PtP value and plot as topomap
+    Interactive 2D flattened topomap of STD/PtP values (taken over all time).
+
+    This is the flattened (nose-up) counterpart of ``plot_3d_topomap_std_ptp_csv``:
+    the same per-channel scalar and co-located-sensor grouping, rendered as an
+    interpolated field with sensor markers via the shared 2D renderer.
+
+    Parameters
+    ----------
+    sensors_csv_path : str
+        Path to the tsv file with the sensors locations and metric values.
+    ch_type : str
+        Type of the channels: mag or grad
+    what_data : str
+        'peaks' or 'stds'
+
+    Returns
+    -------
+    qc_derivative : List
+        A list with one QC_derivative wrapping the plotly figure (or empty).
     """
 
-    #First, convert scv back into dict with MEG_channel objects:
-
-    df = pd.read_csv(std_csv_path, sep='\t')
+    df = pd.read_csv(sensors_csv_path, sep='\t')
     if 'Type' not in df.columns:
         return []
     df = df[df['Type'] == ch_type].copy()
@@ -1848,73 +1886,61 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
-    if what_data=='peaks':
-        y_ax_and_fig_title='Peak-to-peak amplitude'
-        fig_name='PP_manual_all_data_Topomap_'+ch_tit
-    elif what_data=='stds':
-        y_ax_and_fig_title='Standard deviation'
-        fig_name='STD_epoch_all_data_Topomap_'+ch_tit
+    if what_data == 'peaks':
+        fig_name = 'PP_manual_all_data_Topomap_2D_' + ch_tit
+        metric = 'PtP'
+        metric_title = 'Peak-to-peak amplitude'
+    elif what_data == 'stds':
+        fig_name = 'STD_epoch_all_data_Topomap_2D_' + ch_tit
+        metric = 'STD'
+        metric_title = 'Standard deviation'
     else:
         raise ValueError('what_data must be set to "stds" or "peaks"')
 
-    
-    sensor_location_cols = [col for col in df.columns if 'Sensor_location' in col]
-    if len(sensor_location_cols) < 2:
+    required = {'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required.issubset(set(df.columns)):
+        return []
+    scalar = _metric_scalar_series(df, what_data)
+    if scalar.empty:
+        return []
+    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce')
+    df = df.dropna(subset=['__metric_value__', 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
+    if df.empty:
         return []
 
-    scalars = _metric_scalar_series(df, what_data)
-    if scalars.empty:
+    has_lobe = 'Lobe' in df.columns
+    cols = ['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', '__metric_value__', 'Name']
+    if has_lobe:
+        cols.append('Lobe')
+    sensor_df = df[cols]
+
+    # Group co-located sensors (e.g. Elekta grad pairs) into one point, averaging
+    # the value and listing both channel names + values in the hover text.
+    agg = {
+        '__metric_value__': 'mean',
+        'Name': lambda x: '<br>'.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])]),
+    }
+    if has_lobe:
+        agg['Lobe'] = 'first'
+    grouped = sensor_df.groupby(['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']).agg(agg).reset_index()
+    if grouped.empty:
         return []
 
-    data = pd.to_numeric(scalars, errors='coerce').to_numpy(dtype=float)
-    pos = df[sensor_location_cols[:2]].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
-    if 'Name' in df.columns:
-        names = df['Name'].fillna('').astype(str).tolist()
-    else:
-        names = [f"{ch_type}_{idx}" for idx in range(len(df))]
-
-    # convert to arrays
-    data = np.asarray(data, dtype=float)
-    pos = np.asarray(pos, dtype=float)
-    valid = np.isfinite(data) & np.isfinite(pos).all(axis=1)
-    data = data[valid]
-    pos = pos[valid]
-    if data.size == 0 or pos.size == 0:
-        return []
-
-    # Small deterministic jitter for overlapping planar gradiometer positions.
-    # This avoids interpolation singularities while preserving layout geometry.
-    rounded = np.round(pos, decimals=10)
-    _, inv, counts = np.unique(rounded, axis=0, return_inverse=True, return_counts=True)
-    if np.any(counts > 1):
-        base = max(np.nanstd(pos[:, 0]), np.nanstd(pos[:, 1]), 1e-6) * 1e-3
-        for group_idx, count in enumerate(counts):
-            if count <= 1:
-                continue
-            inds = np.where(inv == group_idx)[0]
-            shifts = np.linspace(-base, base, num=inds.size)
-            pos[inds, 0] += shifts
-
-    fig, ax = plt.subplots(figsize=(7.0, 6.0), layout='constrained')
-    im, _ = mne.viz.plot_topomap(
-        data,
-        pos,
-        ch_type=ch_type,
-        names=None,
-        sensors=True,
-        contours=6,
-        res=256,
-        show=False,
-        axes=ax,
-        sphere=(0.0, 0.0, 0.0, 0.1),
+    fig = make_flat_topomap_figure(
+        grouped['Sensor_location_0'].to_numpy(dtype=float),
+        grouped['Sensor_location_1'].to_numpy(dtype=float),
+        grouped['Sensor_location_2'].to_numpy(dtype=float),
+        grouped['__metric_value__'].to_numpy(dtype=float),
+        grouped['Name'].tolist(),
+        color_title=f'{metric}, {unit}',
+        title=f'{metric_title} flat topomap (2D) for {ch_tit}',
+        hovertext=grouped['Name'].tolist(),
+        lobes=grouped['Lobe'].tolist() if has_lobe else None,
     )
-    cbar = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
-    cbar.set_label(f'{y_ax_and_fig_title} ({unit})')
-    ax.set_title(f'{y_ax_and_fig_title} topomap for {ch_tit}')
+    if fig is None:
+        return []
 
-    qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='matplotlib')]
-
-    return qc_derivative
+    return [QC_derivative(content=fig, name=fig_name, content_type='plotly')]
 
 
 def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: str):
@@ -2005,7 +2031,7 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         marker=dict(
             size=13,
             color=mean_metric_values,  # Use the mean metric values for the color scale
-            colorscale='Turbo',
+            colorscale=BLUE_RED_COLORSCALE,  # high values red, low values blue
             colorbar=dict(
                 title=dict(
                     text=f'{metric}, {unit}',
@@ -2027,6 +2053,7 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         grouped_sensor_locations[:, 1],
         grouped_sensor_locations[:, 2],
     )
+    _add_colormap_menu_3d(fig, 0)
 
     # Set plot layout
     fig.update_layout(
@@ -2080,7 +2107,7 @@ def _plot_3d_channel_metric_csv(
         return "<br>".join([f"{row['Name']}: {row[metric_column]:.2e} {unit_title}" for _, row in group.iterrows()])
 
     grouped_values = sensor_df.groupby(loc_cols)[metric_column].mean()
-    grouped_hover = sensor_df.groupby(loc_cols).apply(_hover_text)
+    grouped_hover = sensor_df.groupby(loc_cols).apply(_hover_text, include_groups=False)
     grouped = grouped_values.reset_index(name='metric_value')
     grouped['hover_text'] = grouped_hover.values
 
@@ -2102,7 +2129,7 @@ def _plot_3d_channel_metric_csv(
             marker=dict(
                 size=12,
                 color=grouped['metric_value'],
-                colorscale='Turbo',
+                colorscale=BLUE_RED_COLORSCALE,  # high values red, low values blue
                 colorbar=dict(
                     title=dict(text=unit_title),
                     x=0.95,
@@ -2117,6 +2144,7 @@ def _plot_3d_channel_metric_csv(
         )
     )
     _add_solid_cap_toggle_to_3d_figure(fig, x_vals, y_vals, z_vals)
+    _add_colormap_menu_3d(fig, 0)
     fig.update_layout(
         height=860,
         margin=dict(t=20, r=24, b=16, l=20),
@@ -2140,27 +2168,32 @@ def _plot_3d_channel_metric_csv(
     ]
 
 
-def plot_3d_topomap_psd_csv(psd_csv_path: str, ch_type: str):
-    """Create 3D topomap for PSD mains relative power per channel."""
+def _psd_mains_ratio_df(psd_csv_path: str, ch_type: str):
+    """Return ``(df_ch, ch_tit)`` with a ``__psd_mains_ratio__`` column.
+
+    Shared by the 3D and 2D PSD topomaps so both use the identical per-channel
+    scalar (mains-band PSD divided by a low-frequency baseline). Returns
+    ``(None, None)`` when the file/columns are unsuitable.
+    """
     base_name = os.path.basename(psd_csv_path).lower()
     if 'desc-psds' not in base_name:
-        return []
+        return None, None
 
     df = pd.read_csv(psd_csv_path, sep='\t')
     freq_cols = [col for col in df.columns if col.startswith('PSD_Hz_')]
     if not freq_cols:
-        return []
+        return None, None
 
     freqs = np.array([float(col.replace('PSD_Hz_', '')) for col in freq_cols], dtype=float)
     if 'Type' not in df.columns:
-        return []
+        return None, None
     df_ch = df[df['Type'] == ch_type].copy()
     if df_ch.empty:
-        return []
+        return None, None
 
     psd_matrix = df_ch[freq_cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
     if psd_matrix.size == 0 or np.isnan(psd_matrix).all():
-        return []
+        return None, None
 
     mains_mask = (freqs >= 45.0) & (freqs <= 65.0)
     if np.any(mains_mask):
@@ -2180,10 +2213,17 @@ def plot_3d_topomap_psd_csv(psd_csv_path: str, ch_type: str):
         baseline = np.nanmedian(psd_matrix, axis=1)
 
     eps = np.nanmedian(np.abs(psd_matrix)) * 1e-9 + 1e-30
-    mains_ratio = psd_matrix[:, mains_idx] / (baseline + eps)
-    df_ch['__psd_mains_ratio__'] = mains_ratio
+    df_ch['__psd_mains_ratio__'] = psd_matrix[:, mains_idx] / (baseline + eps)
 
     ch_tit, _ = get_tit_and_unit(ch_type)
+    return df_ch, ch_tit
+
+
+def plot_3d_topomap_psd_csv(psd_csv_path: str, ch_type: str):
+    """Create 3D topomap for PSD mains relative power per channel."""
+    df_ch, ch_tit = _psd_mains_ratio_df(psd_csv_path, ch_type)
+    if df_ch is None:
+        return []
     return _plot_3d_channel_metric_csv(
         df_ch,
         ch_type,
@@ -2221,6 +2261,181 @@ def plot_3d_topomap_ecg_eog_csv(f_path: str, ch_type: str, ecg_or_eog: str):
         fig_name=f'{upper_metric}_channel_wise_topomap_3D_{ch_tit}',
         description_for_user=f'Per-channel scalar is absolute {upper_metric} correlation magnitude |r|.',
     )
+
+
+def _plot_2d_channel_metric_csv(
+    df: pd.DataFrame,
+    ch_type: str,
+    metric_column: str,
+    *,
+    title: str,
+    unit_title: str,
+    color_title: str,
+    fig_name: str,
+    description_for_user: str = "",
+):
+    """Flattened 2D counterpart of ``_plot_3d_channel_metric_csv``.
+
+    Groups co-located sensors (mean scalar, merged hover names) and renders the
+    interpolated flattened field via the shared 2D renderer.
+    """
+    required_cols = {'Name', 'Type', metric_column, 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required_cols.issubset(set(df.columns)):
+        return []
+
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
+
+    df[metric_column] = pd.to_numeric(df[metric_column], errors='coerce')
+    df = df.dropna(subset=[metric_column, 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
+    if df.empty:
+        return []
+
+    loc_cols = ['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']
+    has_lobe = 'Lobe' in df.columns
+    keep_cols = loc_cols + [metric_column, 'Name'] + (['Lobe'] if has_lobe else [])
+    sensor_df = df[keep_cols].copy()
+
+    def _hover_text(group: pd.DataFrame) -> str:
+        return "<br>".join([f"{row['Name']}: {row[metric_column]:.2e} {unit_title}" for _, row in group.iterrows()])
+
+    grouped_values = sensor_df.groupby(loc_cols)[metric_column].mean()
+    grouped_hover = sensor_df.groupby(loc_cols).apply(_hover_text, include_groups=False)
+    grouped = grouped_values.reset_index(name='metric_value')
+    grouped['hover_text'] = grouped_hover.values
+    if has_lobe:
+        grouped['Lobe'] = sensor_df.groupby(loc_cols)['Lobe'].first().values
+    if grouped.empty:
+        return []
+
+    fig = make_flat_topomap_figure(
+        grouped['Sensor_location_0'].to_numpy(dtype=float),
+        grouped['Sensor_location_1'].to_numpy(dtype=float),
+        grouped['Sensor_location_2'].to_numpy(dtype=float),
+        grouped['metric_value'].to_numpy(dtype=float),
+        grouped['hover_text'].tolist(),
+        color_title=color_title,
+        title=title,
+        hovertext=grouped['hover_text'].tolist(),
+        lobes=grouped['Lobe'].tolist() if has_lobe else None,
+    )
+    if fig is None:
+        return []
+
+    return [
+        QC_derivative(
+            content=fig,
+            name=fig_name,
+            content_type='plotly',
+            description_for_user=description_for_user,
+        )
+    ]
+
+
+def plot_2d_topomap_psd_csv(psd_csv_path: str, ch_type: str):
+    """Create flattened 2D topomap for PSD mains relative power per channel."""
+    df_ch, ch_tit = _psd_mains_ratio_df(psd_csv_path, ch_type)
+    if df_ch is None:
+        return []
+    return _plot_2d_channel_metric_csv(
+        df_ch,
+        ch_type,
+        '__psd_mains_ratio__',
+        title=f'PSD channel-wise flat topomap (2D): mains relative power for {ch_tit}',
+        unit_title='ratio',
+        color_title='ratio',
+        fig_name=f'PSD_channel_wise_topomap_2D_{ch_tit}',
+        description_for_user='Per-channel scalar is mains relative power (mains-band PSD divided by low-frequency baseline PSD).',
+    )
+
+
+def plot_2d_topomap_ecg_eog_csv(f_path: str, ch_type: str, ecg_or_eog: str):
+    """Create flattened 2D topomap for ECG/EOG correlation magnitude per channel."""
+    base_name = os.path.basename(f_path).lower()
+    metric = ecg_or_eog.strip().lower()
+    if metric == 'ecg' and 'desc-ecgs' not in base_name:
+        return []
+    if metric == 'eog' and 'desc-eogs' not in base_name:
+        return []
+
+    corr_col = f'{metric}_corr_coeff'
+    df = pd.read_csv(f_path, sep='\t')
+    if corr_col not in df.columns:
+        return []
+
+    df[corr_col] = pd.to_numeric(df[corr_col], errors='coerce').abs()
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    upper_metric = metric.upper()
+    return _plot_2d_channel_metric_csv(
+        df,
+        ch_type,
+        corr_col,
+        title=f'{upper_metric} correlation-magnitude flat topomap (2D) for {ch_tit}',
+        unit_title='|r|',
+        color_title='|r|',
+        fig_name=f'{upper_metric}_channel_wise_topomap_2D_{ch_tit}',
+        description_for_user=f'Per-channel scalar is absolute {upper_metric} correlation magnitude |r|.',
+    )
+
+
+def plot_sensors_2d_csv(sensors_csv_path: str):
+    """Flattened 2D counterpart of ``plot_sensors_3d_csv`` (lobe-coloured).
+
+    Renders the sensor geometry on the flattened (nose-up) disc, colour-coded by
+    brain area, with one legend entry per lobe. Returns an empty list when the
+    file is unsuitable (e.g. ECG/EOG channel files or missing locations).
+    """
+    file_name = os.path.basename(sensors_csv_path)
+    if 'ecgchannel' in file_name.lower() or 'eogchannel' in file_name.lower():
+        return []
+
+    df = pd.read_csv(sensors_csv_path, sep='\t')
+    if 'Lobe' not in df.columns or 'System' not in df.columns:
+        return []
+
+    required = {'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required.issubset(set(df.columns)):
+        return []
+
+    df = df.copy()
+    for col in ('Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=list(required))
+    if df.empty:
+        return []
+
+    system = get_meg_system(df)
+    if system.upper() == 'TRIUX':
+        fig_desc = "Magnetometers names end with '1' like 'MEG0111'. Gradiometers names end with '2' and '3' like 'MEG0112', 'MEG0113'."
+    else:
+        fig_desc = ""
+
+    names = df['Name'].fillna('').astype(str).tolist() if 'Name' in df.columns else [f'ch_{i}' for i in range(len(df))]
+    colors = df['Lobe Color'].fillna('#1f77b4').astype(str).tolist() if 'Lobe Color' in df.columns else ['#1f77b4'] * len(df)
+    lobes = df['Lobe'].fillna('Unknown').astype(str).tolist()
+
+    fig = make_flat_sensor_figure(
+        df['Sensor_location_0'].to_numpy(dtype=float),
+        df['Sensor_location_1'].to_numpy(dtype=float),
+        df['Sensor_location_2'].to_numpy(dtype=float),
+        names,
+        colors,
+        title='Sensors positions (2D flattened)',
+        lobes=lobes,
+    )
+    if fig is None:
+        return []
+
+    return [
+        QC_derivative(
+            content=fig,
+            name='Sensors_positions_2D',
+            content_type='plotly',
+            description_for_user=fig_desc,
+            fig_order=-1,
+        )
+    ]
 
 
 # ______________________PSD__________________________
@@ -3787,16 +4002,20 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
         if 'STD' in metric.upper():
             if include_sensor_plots:
                 _extend_safe(std_derivs, plot_sensors_3d_csv, tsv_path)
+                _extend_safe(std_derivs, plot_sensors_2d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
                 _extend_safe(std_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, plot_2d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='stds')
                 _extend_safe(std_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='stds')
                 _extend_safe(std_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='stds')
 
         if 'PTP' in metric.upper():
             if include_sensor_plots:
                 _extend_safe(ptp_manual_derivs, plot_sensors_3d_csv, tsv_path)
+                _extend_safe(ptp_manual_derivs, plot_sensors_2d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
                 _extend_safe(ptp_manual_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, plot_2d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
                 _extend_safe(ptp_manual_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
                 _extend_safe(ptp_manual_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
 
@@ -3804,29 +4023,35 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
             method = 'welch'
             if include_sensor_plots:
                 _extend_safe(psd_derivs, plot_sensors_3d_csv, tsv_path)
+                _extend_safe(psd_derivs, plot_sensors_2d_csv, tsv_path)
             for m_or_g in m_or_g_chosen:
                 _extend_safe(psd_derivs, Plot_psd_csv, m_or_g, tsv_path, method)
                 _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='noise')
                 _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='waves')
                 _extend_safe(psd_derivs, plot_3d_topomap_psd_csv, tsv_path, ch_type=m_or_g)
+                _extend_safe(psd_derivs, plot_2d_topomap_psd_csv, tsv_path, ch_type=m_or_g)
 
         elif 'ECG' in metric.upper():
             if include_sensor_plots:
                 _extend_safe(ecg_derivs, plot_sensors_3d_csv, tsv_path)
+                _extend_safe(ecg_derivs, plot_sensors_2d_csv, tsv_path)
             _extend_safe(ecg_derivs, plot_ECG_EOG_channel_csv, tsv_path)
             _extend_safe(ecg_derivs, plot_mean_rwave_csv, tsv_path, 'ECG')
             for m_or_g in m_or_g_chosen:
                 _extend_safe(ecg_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'ECG', flip_data=False)
                 _extend_safe(ecg_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'ECG')
+                _extend_safe(ecg_derivs, plot_2d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'ECG')
 
         elif 'EOG' in metric.upper():
             if include_sensor_plots:
                 _extend_safe(eog_derivs, plot_sensors_3d_csv, tsv_path)
+                _extend_safe(eog_derivs, plot_sensors_2d_csv, tsv_path)
             _extend_safe(eog_derivs, plot_ECG_EOG_channel_csv, tsv_path)
             _extend_safe(eog_derivs, plot_mean_rwave_csv, tsv_path, 'EOG')
             for m_or_g in m_or_g_chosen:
                 _extend_safe(eog_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'EOG', flip_data=False)
                 _extend_safe(eog_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'EOG')
+                _extend_safe(eog_derivs, plot_2d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'EOG')
 
         elif 'MUSCLE' in metric.upper():
             _extend_safe(muscle_derivs, plot_muscle_csv, tsv_path)

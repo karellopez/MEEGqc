@@ -3,6 +3,7 @@ import os
 import ancpbids
 import json
 import csv
+import configparser
 import datetime as dt
 import html
 from prompt_toolkit.shortcuts import checkboxlist_dialog
@@ -639,24 +640,29 @@ def _human_derivative_tab_label(metric_key: str, raw_name: str) -> str:
 
     if name_l == "sensors_positions":
         return "Channel layout (3D)"
+    if name_l == "sensors_positions_2d":
+        return "Channel layout (2D)"
+
+    # Flattened topomaps embed the "2d" token; 3D ones do not.
+    _dim = "2D" if "2d" in name_l else "3D"
 
     if "std" in metric_l:
         if "per_channel" in name_l:
             return "Channel x epoch heatmap"
         if "topomap" in name_l:
-            return "Channel-wise STD topomap (3D)"
+            return f"Channel-wise STD topomap ({_dim})"
         if "all_data" in name_l:
             return "Channel-wise STD distribution"
     if "ptp" in metric_l:
         if "per_channel" in name_l:
             return "Channel x epoch heatmap"
         if "topomap" in name_l:
-            return "Channel-wise PtP topomap (3D)"
+            return f"Channel-wise PtP topomap ({_dim})"
         if "all_data" in name_l:
             return "Channel-wise PtP distribution"
     if "psd" in metric_l:
         if "topomap" in name_l:
-            return "Channel-wise PSD topomap (3D)"
+            return f"Channel-wise PSD topomap ({_dim})"
         if "all_data" in name_l:
             return "PSD curves by channel"
         if "noise" in name_l:
@@ -665,7 +671,7 @@ def _human_derivative_tab_label(metric_key: str, raw_name: str) -> str:
             return "Relative power (canonical bands)"
     if "ecg" in metric_l:
         if "topomap" in name_l:
-            return "Channel-wise ECG topomap (3D)"
+            return f"Channel-wise ECG topomap ({_dim})"
         if "mean_ch_data" in name_l:
             return "ECG channel waveform"
         if "most_affected" in name_l:
@@ -676,7 +682,7 @@ def _human_derivative_tab_label(metric_key: str, raw_name: str) -> str:
             return "Lowest correlation-magnitude channels"
     if "eog" in metric_l:
         if "topomap" in name_l:
-            return "Channel-wise EOG topomap (3D)"
+            return f"Channel-wise EOG topomap ({_dim})"
         if "mean_ch_data" in name_l:
             return "EOG channel waveform"
         if "most_affected" in name_l:
@@ -719,7 +725,13 @@ def _collect_run_sensor_derivatives(derivs_for_this_raw: Sequence["Deriv_to_plot
             except Exception:
                 figs = []
             if figs:
-                return figs, [path]
+                # Pair the 3D geometry with its flattened (2D) counterpart so
+                # both appear as adjacent tabs in the Overview sensor panel.
+                try:
+                    figs_2d = plot_sensors_2d_csv(path)
+                except Exception:
+                    figs_2d = []
+                return figs + figs_2d, [path]
     return [], []
 
 
@@ -1341,28 +1353,38 @@ def _build_subject_overview_section(
             src_html = f"<details><summary>Sources</summary><ul>{src_items}</ul></details>"
 
         if embedded_eeg_note and len(derivs) > 1:
-            # Separate sensor plots into MEG and EEG subtabs
+            # Separate sensor plots into MEG and EEG subtabs; within each, the
+            # 3D and 2D layouts become adjacent plot subtabs.
             meg_sensor_derivs = [d for d in derivs if _infer_derivative_channel_type(d) in ("MAG", "GRAD", "ALL")]
             eeg_sensor_derivs = [d for d in derivs if _infer_derivative_channel_type(d) == "EEG"]
             ch_type_tabs: List[Tuple[str, str]] = []
             if meg_sensor_derivs:
-                ch_type_tabs.append(("MEG sensors", "".join(_plot_block_from_derivative(d) for d in meg_sensor_derivs)))
+                ch_type_tabs.append(("MEG sensors", _build_derivative_plot_tabs(
+                    group_id=f"overview-sensors-meg-{_sanitize_token(run_label)}",
+                    metric_key="SENSORS", derivatives=meg_sensor_derivs, level=4)))
             if eeg_sensor_derivs:
-                ch_type_tabs.append(("EEG sensors", "".join(_plot_block_from_derivative(d) for d in eeg_sensor_derivs)))
+                ch_type_tabs.append(("EEG sensors", _build_derivative_plot_tabs(
+                    group_id=f"overview-sensors-eeg-{_sanitize_token(run_label)}",
+                    metric_key="SENSORS", derivatives=eeg_sensor_derivs, level=4)))
             if not ch_type_tabs:
-                ch_type_tabs.append(("All sensors", "".join(_plot_block_from_derivative(d) for d in derivs)))
+                ch_type_tabs.append(("All sensors", _build_derivative_plot_tabs(
+                    group_id=f"overview-sensors-all-{_sanitize_token(run_label)}",
+                    metric_key="SENSORS", derivatives=derivs, level=4)))
             sensor_content = src_html + _build_subtabs_html(
                 f"overview-sensors-chtype-{_sanitize_token(run_label)}", ch_type_tabs, level=3
             )
         else:
-            sensor_blocks = "".join(_plot_block_from_derivative(d) for d in derivs)
-            sensor_content = src_html + sensor_blocks
+            # One plot subtab per layout (3D / 2D) so users can switch views.
+            sensor_content = src_html + _build_derivative_plot_tabs(
+                group_id=f"overview-sensors-{_sanitize_token(run_label)}",
+                metric_key="SENSORS", derivatives=derivs, level=3,
+            )
 
         sensor_tabs.append((run_label, sensor_content))
 
     if sensor_tabs:
         overview_html += (
-            "<h3>Sensor positions (3D, one panel per run)</h3>"
+            "<h3>Sensor positions (3D &amp; 2D, one panel per run)</h3>"
             "<p>Sensor geometry is shown once here to avoid repeating the same view under every metric tab.</p>"
             + _build_subtabs_html("overview-sensors-runs", sensor_tabs, level=2)
         )
@@ -1935,6 +1957,92 @@ def _build_subject_qc_metric_run_panel(
     return "".join(blocks)
 
 
+def _megqc_version() -> str:
+    """Return the installed MEEGqc package version (best effort)."""
+    try:
+        import meg_qc
+        return str(getattr(meg_qc, "__version__", "unknown"))
+    except Exception:
+        return "unknown"
+
+
+def _resolve_used_settings_path(config_dir: Optional[Path]) -> Optional[Path]:
+    """Locate the settings snapshot written by the calculation step.
+
+    Prefers the newest ``*UsedSettings*.ini`` snapshot saved under the analysis
+    ``config`` folder (the exact settings used for this run). Falls back to the
+    packaged default ``settings.ini`` so the tab is never empty.
+    """
+    if config_dir is not None:
+        try:
+            cfg_dir = Path(config_dir)
+            if cfg_dir.is_dir():
+                snaps = sorted(
+                    cfg_dir.glob("*UsedSettings*.ini"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if snaps:
+                    return snaps[0]
+                any_ini = sorted(cfg_dir.glob("*.ini"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if any_ini:
+                    return any_ini[0]
+        except Exception:
+            pass
+    # Package default fallback.
+    default = Path(__file__).resolve().parent.parent / "settings" / "settings.ini"
+    return default if default.exists() else None
+
+
+def _build_settings_snapshot_section(config_dir: Optional[Path]) -> str:
+    """Render an elegant, sectioned snapshot of the settings used for this run."""
+    settings_path = _resolve_used_settings_path(config_dir)
+    if settings_path is None:
+        return (
+            "<section><h2>Settings snapshot</h2>"
+            "<p>No settings file could be located for this analysis.</p></section>"
+        )
+
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    try:
+        parser.read(settings_path, encoding="utf-8")
+    except Exception as exc:
+        return (
+            "<section><h2>Settings snapshot</h2>"
+            f"<p>Failed to parse settings file <code>{html.escape(str(settings_path))}</code>: "
+            f"{html.escape(str(exc))}</p></section>"
+        )
+
+    cards = []
+    for section in parser.sections():
+        items = list(parser.items(section))
+        if not items:
+            continue
+        rows = "".join(
+            f"<tr><td class='set-key'>{html.escape(str(k))}</td>"
+            f"<td class='set-val'>{html.escape(str(v)) if str(v).strip() else '<em>(empty)</em>'}</td></tr>"
+            for k, v in items
+        )
+        cards.append(
+            "<details class='settings-card' open>"
+            f"<summary>{html.escape(section)}</summary>"
+            f"<table class='settings-table'><tbody>{rows}</tbody></table>"
+            "</details>"
+        )
+
+    if not cards:
+        cards.append("<p>The settings file contains no sections.</p>")
+
+    return (
+        "<section class='settings-snapshot'>"
+        "<h2>Settings snapshot</h2>"
+        "<p>These are the exact parameters used to compute this report. "
+        f"Source: <code>{html.escape(settings_path.name)}</code></p>"
+        f"<div class='settings-grid'>{''.join(cards)}</div>"
+        "</section>"
+    )
+
+
 def _build_subject_report_html(
     *,
     subject: str,
@@ -1943,6 +2051,7 @@ def _build_subject_report_html(
     overview_payload: List[Dict[str, Any]],
     summary_payload: List[Dict[str, Any]],
     embedded_eeg_note: bool = False,
+    config_dir: Optional[Path] = None,
 ) -> str:
     """Compose one self-contained subject report.
 
@@ -1959,6 +2068,7 @@ def _build_subject_report_html(
     _reset_lazy_figure_store()
 
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    megqc_version = _megqc_version()
     top_tabs: List[Tuple[str, str]] = [
         (
             "Overview",
@@ -2012,6 +2122,13 @@ def _build_subject_report_html(
         )
     )
 
+    top_tabs.append(
+        (
+            "Settings",
+            _build_settings_snapshot_section(config_dir),
+        )
+    )
+
     tab_buttons = []
     tab_panels = []
     for idx, (label, panel_html) in enumerate(top_tabs):
@@ -2031,7 +2148,7 @@ def _build_subject_report_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Subject QA report sub-{html.escape(subject)}</title>
+  <title>MEEGqc subject report sub-{html.escape(subject)}</title>
   {plotly_bundle_script}
   <style>
     body {{
@@ -2276,6 +2393,52 @@ def _build_subject_report_html(
     @keyframes spin {{
       to {{ transform: rotate(360deg); }}
     }}
+    .settings-snapshot .settings-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 14px;
+      margin-top: 8px;
+    }}
+    .settings-card {{
+      border: 1px solid #d7e6f7;
+      border-radius: 12px;
+      background: #fbfdff;
+      box-shadow: 0 3px 12px rgba(7, 41, 74, 0.06);
+      overflow: hidden;
+    }}
+    .settings-card > summary {{
+      cursor: pointer;
+      list-style: none;
+      padding: 10px 14px;
+      font-weight: 700;
+      color: #0f3d6e;
+      background: linear-gradient(135deg, #eaf3ff, #f5f9ff);
+      border-bottom: 1px solid #e1edfa;
+    }}
+    .settings-card > summary::-webkit-details-marker {{ display: none; }}
+    .settings-card > summary::before {{ content: "\\25B8  "; color: #2b6cb0; }}
+    .settings-card[open] > summary::before {{ content: "\\25BE  "; }}
+    table.settings-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    table.settings-table td {{
+      padding: 6px 12px;
+      border-bottom: 1px solid #eef4fb;
+      vertical-align: top;
+    }}
+    table.settings-table td.set-key {{
+      color: #334e68;
+      font-weight: 600;
+      width: 46%;
+      word-break: break-word;
+    }}
+    table.settings-table td.set-val {{
+      color: #0b1f33;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      word-break: break-word;
+    }}
   </style>
 </head>
 <body>
@@ -2288,8 +2451,8 @@ def _build_subject_report_html(
   </div>
   <main>
     <section>
-      <h1>MEG QC subject report</h1>
-      <p><strong>Dataset:</strong> {html.escape(dataset_name)} | <strong>Subject:</strong> sub-{html.escape(subject)} | <strong>Generated:</strong> {generated}</p>
+      <h1>MEEGqc subject report</h1>
+      <p><strong>Dataset:</strong> {html.escape(dataset_name)} | <strong>Subject:</strong> sub-{html.escape(subject)} | <strong>Generated:</strong> {generated} | <strong>MEEGqc version:</strong> {html.escape(megqc_version)}</p>
       <p>This report consolidates all metrics into one HTML file. Figures are lazily rendered when their tab becomes visible.</p>
       <div class="tab-row">
         {''.join(tab_buttons)}
@@ -2823,7 +2986,7 @@ def _write_subject_metric_log(
     }
 
     txt_lines = [
-        f"MEGqc Metric Log -- sub-{subject}",
+        f"MEEGqc Metric Log -- sub-{subject}",
         f"Generated: {generated}",
         f"Modalities: MEG={'yes' if has_meg else 'no'}, EEG={'yes' if has_eeg else 'no'}",
         f"Summary: {n_ok} OK, {n_warn} warnings, {n_err} errors, {n_skip} skipped ({len(metric_log)} total)",
@@ -2882,6 +3045,9 @@ def process_subject(
         output_derivatives_root,
         analysis_segments=analysis_segments,
     )
+    # Settings snapshots are saved under ``<megqc_root>/config`` by the
+    # calculation step; reports_root is ``<megqc_root>/reports``.
+    config_dir = Path(reports_root).parent / "config"
 
     # Sort run keys for deterministic tab ordering.
     existing_raws_per_sub = sorted(set(
@@ -3136,6 +3302,7 @@ def process_subject(
             overview_payload=meg_overview,
             summary_payload=meg_summary,
             embedded_eeg_note=meg_has_embedded_eeg,
+            config_dir=config_dir,
         )
         meg_folder = reports_root / "meg" / f"sub-{sub}"
         meg_folder.mkdir(parents=True, exist_ok=True)
@@ -3158,6 +3325,7 @@ def process_subject(
             metrics_payload=eeg_payload,
             overview_payload=eeg_overview,
             summary_payload=eeg_summary,
+            config_dir=config_dir,
         )
         eeg_folder = reports_root / "eeg" / f"sub-{sub}"
         eeg_folder.mkdir(parents=True, exist_ok=True)
@@ -3174,6 +3342,7 @@ def process_subject(
             metrics_payload=metrics_payload,
             overview_payload=overview_payload,
             summary_payload=summary_payload,
+            config_dir=config_dir,
         )
         subject_folder = reports_root / f"sub-{sub}"
         subject_folder.mkdir(parents=True, exist_ok=True)

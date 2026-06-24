@@ -38,6 +38,7 @@ except Exception:
 
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
+from meg_qc.plotting.topomap_2d import make_flat_topomap_figure
 
 
 MODULES = ("STD", "PTP", "PSD", "ECG", "EOG", "Muscle")
@@ -1674,70 +1675,38 @@ def plot_topomap_if_available(
     title: str,
     color_title: str,
 ) -> Optional[go.Figure]:
+    """Render the classic flattened (nose-up) interpolated topomap.
+
+    Uses the shared 2D renderer (azimuthal projection of the 3D sensor
+    geometry + interpolated field + sensor markers) so group and subject
+    reports look identical. Falls back to the available 2D coordinates when
+    the layout carries no Z column.
+    """
     if payload is None:
         return None
     x = np.asarray(payload.layout.x, dtype=float).reshape(-1)
     y = np.asarray(payload.layout.y, dtype=float).reshape(-1)
+    z = getattr(payload.layout, "z", None)
+    z = None if z is None else np.asarray(z, dtype=float).reshape(-1)
     values = np.asarray(payload.values, dtype=float).reshape(-1)
-    n = min(x.size, y.size, values.size, len(payload.layout.names))
+    names = list(payload.layout.names)
+
+    n = min(x.size, y.size, values.size, len(names))
+    if z is not None:
+        n = min(n, z.size)
     if n < 3:
         return None
+    x, y, values, names = x[:n], y[:n], values[:n], names[:n]
+    if z is not None:
+        z = z[:n]
 
-    x = x[:n]
-    y = y[:n]
-    values = values[:n]
-    names = np.asarray(payload.layout.names[:n], dtype=object)
-
-    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
-    if np.sum(mask) < 3:
-        return None
-
-    # Spread overlapping points slightly so Elekta triplets (1 mag + 2 grad) remain visible.
-    x_plot = x[mask].copy()
-    y_plot = y[mask].copy()
-    v_plot = values[mask]
-    n_plot = names[mask]
-    xy_key = np.round(np.column_stack([x_plot, y_plot]), 6)
-    unique, inv = np.unique(xy_key, axis=0, return_inverse=True)
-    xrange = float(np.nanmax(x_plot) - np.nanmin(x_plot)) if x_plot.size else 1.0
-    yrange = float(np.nanmax(y_plot) - np.nanmin(y_plot)) if y_plot.size else 1.0
-    base_r = max(xrange, yrange) * 0.012
-    if not np.isfinite(base_r) or base_r <= 0:
-        base_r = 1e-3
-    for k in range(unique.shape[0]):
-        idx = np.where(inv == k)[0]
-        if idx.size <= 1:
-            continue
-        angles = np.linspace(0.0, 2.0 * np.pi, num=idx.size, endpoint=False)
-        x_plot[idx] += base_r * np.cos(angles)
-        y_plot[idx] += base_r * np.sin(angles)
-
-    fig = go.Figure(
-        go.Scatter(
-            x=x_plot,
-            y=y_plot,
-            mode="markers",
-            text=n_plot,
-            customdata=v_plot,
-            hovertemplate="%{text}<br>value=%{customdata:.3g}<extra></extra>",
-            marker={
-                "size": 11,
-                "color": v_plot,
-                "colorscale": "Viridis",
-                "showscale": True,
-                "colorbar": {"title": color_title},
-                "line": {"width": 0.5, "color": "#2F3E46"},
-            },
-        )
+    hover = [f"{nm}<br>value={v:.3g}" for nm, v in zip(names, values)]
+    return make_flat_topomap_figure(
+        x, y, z, values, names,
+        color_title=color_title,
+        title=title,
+        hovertext=hover,
     )
-    fig.update_layout(
-        title={"text": title, "x": 0.5},
-        template="plotly_white",
-        xaxis={"visible": False, "scaleanchor": "y", "scaleratio": 1},
-        yaxis={"visible": False},
-        margin={"l": 40, "r": 40, "t": 70, "b": 35},
-    )
-    return fig
 
 
 def _add_solid_cap_toggle_to_topomap_3d(
@@ -6757,9 +6726,9 @@ def _build_report_html(
     <section>
       <div class="report-header">
         <div>
-          <h1>QA group report: {dataset_name}</h1>
+          <h1>MEEGqc QA group report: {dataset_name}</h1>
           <p><strong>Generated:</strong> {generated}</p>
-          <p><strong>MEGqc version:</strong> {version}</p>
+          <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Epoch label:</strong> epochs</p>
         </div>
       </div>

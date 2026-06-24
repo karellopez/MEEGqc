@@ -2626,7 +2626,7 @@ def _tab_content(
     for ds_name in sorted(general_settings_snapshots):
         snapshot_tiles.append(
             "<div class='tile'>"
-            f"<h3>General MEGqc settings snapshot ({html.escape(ds_name)})</h3>"
+            f"<h3>General MEEGqc settings snapshot ({html.escape(ds_name)})</h3>"
             f"<pre>{html.escape(general_settings_snapshots[ds_name])}</pre>"
             "</div>"
         )
@@ -2974,9 +2974,9 @@ def _build_report_html(
     <section>
       <div class="report-header">
         <div>
-          <h1>QC group report: {report_name}</h1>
+          <h1>MEEGqc QC group report: {report_name}</h1>
           <p><strong>Generated:</strong> {generated}</p>
-          <p><strong>MEGqc version:</strong> {version}</p>
+          <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Attempt selection:</strong> {html.escape(attempt_text)}</p>
           <p><strong>Important:</strong> this QC report complements QA views with burden percentages and ranking summaries per metric.</p>
         </div>
