@@ -39,6 +39,7 @@ except Exception:
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 from meg_qc.plotting.topomap_2d import make_flat_topomap_figure
+from meg_qc.plotting.universal_plots import amplitude_scale_unit
 
 
 MODULES = ("STD", "PTP", "PSD", "ECG", "EOG", "Muscle")
@@ -1499,7 +1500,17 @@ def plot_heatmap_sorted_channels_windows(
         }
 
     metric_short = "STD" if "std" in color_title.lower() else ("PtP" if "ptp" in color_title.lower() else color_title)
-    unit_short = "mixed pT" if "mixed" in color_title.lower() else ("pT" if "pt" in color_title.lower() else "")
+    _ct = color_title.lower()
+    if "mixed" in _ct:
+        unit_short = "mixed fT"
+    elif "ft/cm" in _ct:
+        unit_short = "fT/cm"
+    elif "ft" in _ct:
+        unit_short = "fT"
+    elif "µv" in _ct or "uv" in _ct:
+        unit_short = "µV"
+    else:
+        unit_short = ""
     side_title = f"{metric_short} ({unit_short})" if unit_short else str(metric_short)
     colorbar_title = str(metric_short)
 
@@ -6267,13 +6278,13 @@ def _build_statistical_appendix_section(acc: ChTypeAccumulator, amplitude_unit: 
 def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool) -> str:
     tab_token = re.sub(r"[^a-z0-9]+", "-", tab_name.lower())
     if is_combined:
-        amplitude_unit = "mixed pT-based MEG units (all channels)"
+        amplitude_unit = "mixed fT-based MEG units (all channels)"
     elif tab_name.upper() == "MAG":
-        amplitude_unit = "picoTesla (pT)"
+        amplitude_unit = "femtoTesla (fT)"
     elif tab_name.upper() == "EEG":
         amplitude_unit = "microVolts (µV)"
     else:
-        amplitude_unit = "picoTesla/m (pT/m)"
+        amplitude_unit = "femtoTesla/cm (fT/cm)"
 
     combined_notice = ""
     if is_combined:
@@ -6286,7 +6297,7 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
             "<h2>Combined Channel-Type Context</h2>"
             f"<p><strong>Per-type run counts:</strong> MAG={mag_rows}, GRAD={grad_rows}; <strong>N subjects:</strong> {n_subjects}.</p>"
             "<p><strong>Unit warning:</strong> The combined tab is cumulative across channel types (MAG + GRAD). "
-            "Amplitude metrics therefore mix pT and pT/m footprints. Use MAG and GRAD tabs for strict unit-specific interpretation.</p>"
+            "Amplitude metrics therefore mix fT and fT/cm footprints. Use MAG and GRAD tabs for strict unit-specific interpretation.</p>"
             "</section>"
         )
 
@@ -7306,6 +7317,9 @@ def _update_accumulator_for_loaded_run(
             continue  # MEG channel types inside an EEG recording → skip
 
         acc = acc_by_type[ch_type]
+        # Per-channel-type amplitude scaling to display units: mag -> fT, grad ->
+        # fT/cm (planar) or fT (axial), eeg -> µV. Replaces the old flat pT scale.
+        _amp_scale, _ = amplitude_scale_unit(ch_type)
         acc.run_count += 1
         if record.meta.subject != "n/a":
             acc.subjects.add(record.meta.subject)
@@ -7326,7 +7340,7 @@ def _update_accumulator_for_loaded_run(
         )
 
         if ch_type in std_data:
-            matrix = np.asarray(std_data[ch_type], dtype=float) * TESLA_TO_PICO
+            matrix = np.asarray(std_data[ch_type], dtype=float) * _amp_scale
             # Channel scalar summaries are used for distribution views.
             ch_summary_default_all = np.nanmedian(matrix, axis=1)
             ch_summary_mean_all = np.nanmean(matrix, axis=1)
@@ -7390,7 +7404,7 @@ def _update_accumulator_for_loaded_run(
             module_seen["STD"] = True
 
         if ch_type in ptp_data:
-            matrix = np.asarray(ptp_data[ch_type], dtype=float) * TESLA_TO_PICO
+            matrix = np.asarray(ptp_data[ch_type], dtype=float) * _amp_scale
             ch_summary_default_all = np.nanquantile(matrix, 0.95, axis=1)
             ch_summary_mean_all = np.nanmean(matrix, axis=1)
             ch_summary_upper_all = np.nanquantile(matrix, 0.99, axis=1)

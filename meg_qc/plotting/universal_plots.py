@@ -229,6 +229,31 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
     return m_or_g_tit, unit
 
 
+def amplitude_scale_unit(ch_type, system=None):
+    """Return ``(scale, unit_label)`` to convert SI amplitudes to display units.
+
+    Used to keep units identical across every figure / report:
+
+    - Magnetometers: Tesla -> femtotesla (fT), x1e15.
+    - Gradiometers: planar (Neuromag / Elekta / MEGIN, stored in T/m) -> fT/cm,
+      x1e13; axial (CTF / 4D-BTi / KIT, stored in T) -> fT, x1e15.
+    - EEG / ECG / EOG: Volts -> microvolts (uV), x1e6.
+
+    ``system`` is the acquisition system string (e.g. from ``get_meg_system``)
+    used only to pick planar vs axial gradiometer convention.
+    """
+    t = str(ch_type or '').lower()
+    sys = str(system or '').upper()
+    if t == 'mag':
+        return 1e15, 'fT'
+    if t == 'grad':
+        axial = any(s in sys for s in ('CTF', '4D', 'BTI', 'MAGNES', 'KIT', 'YOKOGAWA', 'RICOH'))
+        if axial:
+            return 1e15, 'fT'
+        return 1e13, 'fT/cm'
+    if t in ('eeg', 'ecg', 'eog'):
+        return 1e6, 'µV'
+    return 1.0, 'a.u.'
 
 
 
@@ -1431,7 +1456,8 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     """
     df = pd.read_csv(std_csv_path, sep='\t')
 
-    ch_tit, unit = get_tit_and_unit(ch_type)
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    scale, unit = amplitude_scale_unit(ch_type, get_meg_system(df) if 'System' in df.columns else None)
 
     if what_data == 'peaks':
         metric_title = 'PtP'
@@ -1452,7 +1478,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     if not epoch_columns:
         return []
 
-    data_matrix = filtered_df[epoch_columns].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    data_matrix = filtered_df[epoch_columns].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float) * scale
     if data_matrix.size == 0 or np.isnan(data_matrix).all():
         return []
 
@@ -1884,7 +1910,8 @@ def plot_2d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     if df.empty:
         return []
 
-    ch_tit, unit = get_tit_and_unit(ch_type)
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    scale, unit = amplitude_scale_unit(ch_type, get_meg_system(df) if 'System' in df.columns else None)
 
     if what_data == 'peaks':
         fig_name = 'PP_manual_all_data_Topomap_2D_' + ch_tit
@@ -1903,7 +1930,7 @@ def plot_2d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     scalar = _metric_scalar_series(df, what_data)
     if scalar.empty:
         return []
-    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce')
+    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce') * scale
     df = df.dropna(subset=['__metric_value__', 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
     if df.empty:
         return []
@@ -1918,7 +1945,7 @@ def plot_2d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     # the value and listing both channel names + values in the hover text.
     agg = {
         '__metric_value__': 'mean',
-        'Name': lambda x: '<br>'.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])]),
+        'Name': lambda x: '<br>'.join([f"{name} - {metric}: {std:.3g} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])]),
     }
     if has_lobe:
         agg['Lobe'] = 'first'
@@ -1976,7 +2003,8 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     if df.empty:
         return []
 
-    ch_tit, unit = get_tit_and_unit(ch_type)
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    scale, unit = amplitude_scale_unit(ch_type, get_meg_system(df) if 'System' in df.columns else None)
 
 
     if what_data=='peaks':
@@ -1987,14 +2015,14 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         metric = 'STD'
     else:
         raise ValueError('what_data must be set to "stds" or "peaks"')
-    
+
     required = {'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
     if not required.issubset(set(df.columns)):
         return []
     scalar = _metric_scalar_series(df, what_data)
     if scalar.empty:
         return []
-    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce')
+    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce') * scale
     df = df.dropna(subset=['__metric_value__', 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
     if df.empty:
         return []
@@ -2005,12 +2033,12 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     # Group by sensor locations, this is done in case we got GRADIOMETERS,
     # cos they have 2 sensors located in the same spot.
     # We calculate mean value for each group: the mean of 'STD all' or 'PtP all' columns for 2 channels,
-    # this mean value will be used to define the color. 
+    # this mean value will be used to define the color.
     # We assume that means std/ptp of physically close to each other gardiomeeters is also close in value.
-    # Here also create groupped names, later used in hover 
+    # Here also create groupped names, later used in hover
     grouped = sensor_df.groupby(['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']).agg({
         '__metric_value__': 'mean',
-        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])])
+        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.3g} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])])
     }).reset_index()
     if grouped.empty:
         return []
@@ -2039,7 +2067,7 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
                 ),
                 tickmode='array',
                 tickvals=[np.min(mean_metric_values), np.max(mean_metric_values)],
-                ticktext=[f'{np.min(mean_metric_values):.2e}', f'{np.max(mean_metric_values):.2e}'],
+                ticktext=[f'{np.min(mean_metric_values):.3g}', f'{np.max(mean_metric_values):.3g}'],
                 ticks='outside'
             ),
             opacity=0.8
@@ -2593,7 +2621,15 @@ def Plot_psd_csv(m_or_g:str, f_path: str, method: str):
     if fig is None:
         return []
 
-    tit, unit = get_tit_and_unit(m_or_g)
+    tit, _ = get_tit_and_unit(m_or_g)
+    # Amplitude spectral density: convert to fT/cm/µV-based units (per √Hz) so the
+    # PSD figure shares the same amplitude convention as every other figure.
+    scale, amp_unit = amplitude_scale_unit(m_or_g, get_meg_system(df) if 'System' in df.columns else None)
+    asd_unit = f"{amp_unit}/√Hz"
+    for tr in fig.data:
+        y = getattr(tr, 'y', None)
+        if y is not None:
+            tr.y = (np.asarray(y, dtype=float) * scale)
     fig.update_layout(
     title={
     'text': method[0].upper()+method[1:]+" periodogram for all "+tit,
@@ -2601,13 +2637,10 @@ def Plot_psd_csv(m_or_g:str, f_path: str, method: str):
     'x':0.5,
     'xanchor': 'center',
     'yanchor': 'top'},
-    yaxis_title="Amplitude, "+unit,
-    yaxis = dict(
-        showexponent = 'all',
-        exponentformat = 'e'),
+    yaxis_title="Amplitude spectral density, "+asd_unit,
     xaxis_title="Frequency (Hz)")
 
-    fig.update_traces(hovertemplate='Frequency: %{x} Hz<br>Amplitude: %{y: .2e} T/Hz')
+    fig.update_traces(hovertemplate='Frequency: %{x} Hz<br>ASD: %{y:.3g} '+asd_unit)
 
     #Add buttons to switch scale between log and linear:
     fig = add_log_buttons(fig)
@@ -2743,8 +2776,12 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
     all_bands_names=bands_names.copy()
     #the lists change in this function and this change is tranfered outside the fuction even when these lists are not returned explicitly.
     #To keep them in original state outside the function, they are copied here.
-    all_mean_abs_values=amplitudes_abs.copy()
-    ch_type_tit, unit = get_tit_and_unit(m_or_g, psd=True)
+    ch_type_tit, _ = get_tit_and_unit(m_or_g, psd=True)
+    # Scale absolute amplitudes to the shared fT/cm/µV convention (per √Hz).
+    scale, amp_unit = amplitude_scale_unit(m_or_g, get_meg_system(df) if 'System' in df.columns else None)
+    asd_unit = f"{amp_unit}/√Hz"
+    all_mean_abs_values = [float(v) * scale for v in amplitudes_abs]
+    total_amplitude = float(total_amplitude) * scale
 
     #If mean relative percentages dont sum up into 100%, add the 'unknown' part.
     all_mean_relative_values=[v * 100 for v in amplitudes_relative]  #in percentage
@@ -2761,7 +2798,7 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
 
     labels=[None]*len(all_bands_names)
     for n, name in enumerate(all_bands_names):
-        labels[n]=name + ': ' + str("%.2e" % all_mean_abs_values[n]) + ' ' + unit # "%.2e" % removes too many digits after coma
+        labels[n]=name + ': ' + str("%.3g" % all_mean_abs_values[n]) + ' ' + asd_unit
 
         #if some of the all_mean_abs_values are zero - they should not be shown in pie chart:
 
@@ -2951,7 +2988,8 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
     if df.empty:
         return []
 
-    ch_tit, unit = get_tit_and_unit(ch_type)
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    scale, unit = amplitude_scale_unit(ch_type, get_meg_system(df) if 'System' in df.columns else None)
 
     if what_data=='peaks':
         hover_tit='PP_Amplitude'
@@ -2980,7 +3018,7 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     default_color = '#2B6CB0'
     for idx, row in df.iterrows():
-        data = float(scalars.get(idx, np.nan))
+        data = float(scalars.get(idx, np.nan)) * scale
         if not np.isfinite(data):
             continue
 
@@ -3019,15 +3057,12 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
     fig = go.Figure(data=all_traces)
 
     #Add hover text to the dots, remove too many digits after coma.
-    fig.update_traces(hovertemplate=hover_tit+': %{x: .2e}')
+    fig.update_traces(hovertemplate=hover_tit+': %{x: .3g}')
 
     #more settings:
     fig.update_layout(
         yaxis_range=[-0.5,0.5],
         yaxis={'visible': False, 'showticklabels': False},
-        xaxis = dict(
-        showexponent = 'all',
-        exponentformat = 'e'),
         xaxis_title=y_ax_and_fig_title+" in "+unit,
         title={
         'text': y_ax_and_fig_title+' of the data for '+ch_tit+' over the entire time series',
@@ -3528,12 +3563,15 @@ def plot_affected_channels_csv(df, artifact_lvl: float, t: np.ndarray, m_or_g: s
             return go.Figure()
 
         #decorate the plot:
-        ch_type_tit, unit = get_tit_and_unit(m_or_g)
+        ch_type_tit, _ = get_tit_and_unit(m_or_g)
+        # Artifact magnitude is measured on MEG channels -> display in fT / fT/cm.
+        scale, unit = amplitude_scale_unit(m_or_g, get_meg_system(df) if 'System' in df.columns else None)
+        for tr in fig.data:
+            y = getattr(tr, 'y', None)
+            if y is not None:
+                tr.y = np.asarray(y, dtype=float) * scale
         fig.update_layout(
             xaxis_title='Time in seconds',
-            yaxis = dict(
-                showexponent = 'all',
-                exponentformat = 'e'),
             yaxis_title='Mean magnitude in '+unit,
             title={
                 'text': fig_tit+str(len(df))+' '+ch_type_tit,
@@ -3779,8 +3817,10 @@ def plot_artif_per_ch_3_groups(f_path: str, m_or_g: str, ecg_or_eog: str, flip_d
 
     limits_df = df[cols]
 
-    ymax = limits_df.loc[:, limits_df.columns != 'Name'].max().max()
-    ymin = limits_df.loc[:, limits_df.columns != 'Name'].min().min()
+    # Match the per-figure amplitude scaling (fT / fT/cm) applied above.
+    _amp_scale, _ = amplitude_scale_unit(m_or_g, get_meg_system(df) if 'System' in df.columns else None)
+    ymax = limits_df.loc[:, limits_df.columns != 'Name'].max().max() * _amp_scale
+    ymin = limits_df.loc[:, limits_df.columns != 'Name'].min().min() * _amp_scale
 
     ylim = [ymin*.95, ymax*1.05]
 

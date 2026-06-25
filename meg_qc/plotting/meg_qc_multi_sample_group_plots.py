@@ -1360,16 +1360,16 @@ def _build_tab_content(
 ) -> str:
     is_combined = tab_name == "Combined (mag+grad)"
     if is_combined:
-        amplitude_unit = "mixed pT-based MEG units (all channels)"
+        amplitude_unit = "mixed fT-based MEG units (all channels)"
         tab_token = "combined"
     elif tab_name == "MAG":
-        amplitude_unit = "picoTesla (pT)"
+        amplitude_unit = "femtoTesla (fT)"
         tab_token = "mag"
     elif tab_name == "EEG":
         amplitude_unit = "microVolts (µV)"
         tab_token = "eeg"
     else:
-        amplitude_unit = "picoTesla/m (pT/m)"
+        amplitude_unit = "femtoTesla/cm (fT/cm)"
         tab_token = "grad"
 
     cohort_section = _build_dataset_subtab_section(
