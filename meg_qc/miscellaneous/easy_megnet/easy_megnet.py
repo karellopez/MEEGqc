@@ -521,15 +521,16 @@ def _classify_ica_with_probabilities(
     import MEGnet
     from MEGnet.megnet_utilities import fPredictChunkAndVoting_parrallel
 
-    megnet_init()  # download model_v2 from HuggingFace if not present
+    model_path = op.join(MEGnet.__path__[0], "model_v2k3", "model_v2.keras")
+    if not op.exists(model_path):
+        print('___MEGqc___: MEGnet model weights not found — downloading from HuggingFace...')
+        megnet_init()
+    else:
+        print('___MEGqc___: MEGnet model weights found.')
 
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["KERAS_BACKEND"] = "torch"
+    import keras
 
-    from tensorflow import keras
-
-    model_path = op.join(MEGnet.__path__[0], "model_v2")
     k_model = keras.models.load_model(model_path)
 
     file_base = outbasename if outbasename is not None else Path(filename).stem

@@ -101,13 +101,16 @@ def compute_megnet_outputs_for_file(
             _classify_ica_with_probabilities,
         )
     except Exception as exc:
-        result['reason'] = (
+        reason = (
             "MEGnet import failed from installed package "
             "(expected dependency: megnet-neuro): "
             f"{exc}"
         )
+        print(f'___MEGqc___: {reason}')
+        result['reason'] = reason
         return result
 
+    print('___MEGqc___: Computing MEGnet outputs for ECG/EOG classification...')
     try:
         # Store MEGnet intermediates under the same profile-scoped .tmp tree
         # used by the rest of MEGqc so delete_temp_folder() cleans them up.
@@ -161,6 +164,7 @@ def compute_megnet_outputs_for_file(
             eog_class_used = eog_secondary
         eog_signal = _compose_megnet_signal(ica_ts, eog_idx, eog_probs)
 
+        print('___MEGqc___: MEGnet outputs computed successfully.')
         result = {
             'status': 'ok',
             'reason': '',
@@ -178,9 +182,11 @@ def compute_megnet_outputs_for_file(
             } if eog_signal.size else None,
         }
     except Exception as exc:
+        reason = f'MEGnet execution failed: {exc}'
+        print(f'___MEGqc___: {reason}')
         result = {
             'status': 'failed',
-            'reason': f'MEGnet execution failed: {exc}',
+            'reason': reason,
             'ecg': None,
             'eog': None,
         }
