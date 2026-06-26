@@ -2,12 +2,12 @@
 
 This module builds dataset-level QA HTML reports from machine-readable outputs
 already produced by the MEGqc calculation step. It reads derivative TSV files
-from ``derivatives/Meg_QC/calculation`` and writes group-level HTML reports to
-``derivatives/Meg_QC/reports``.
+from ``derivatives/MEEGqc/calculation`` and writes dataset-level HTML reports to
+``derivatives/MEEGqc/reports``.
 
 Public entrypoint
 -----------------
-``make_group_plots_meg_qc(dataset_path, derivatives_base=None, n_jobs=1)``
+``make_dataset_plots_meg_qc(dataset_path, derivatives_base=None, n_jobs=1)``
 """
 
 from __future__ import annotations
@@ -2380,8 +2380,8 @@ def _topomap_blocks(
 def _load_settings_snapshot(megqc_root: str) -> dict:
     """Structured, QA-safe snapshot of the settings used for this analysis.
 
-    Delegates to the shared renderer in ``universal_plots`` so the QA group (and
-    multi-sample) reports show the same elegant card view as the subject report.
+    Delegates to the shared renderer in ``universal_plots`` so the QA dataset (and
+    multi-dataset) reports show the same elegant card view as the subject report.
     It parses *whatever* sections exist in the profile's ``*UsedSettings*.ini``
     (future-proof) while hiding QC-threshold keys from the QA view.
     """
@@ -6343,7 +6343,7 @@ def _build_report_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>QA group report {dataset_name}</title>
+  <title>QA dataset report {dataset_name}</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body {{
@@ -6731,7 +6731,7 @@ def _build_report_html(
     <section>
       <div class="report-header">
         <div>
-          <h1>MEEGqc QA group report: {dataset_name}</h1>
+          <h1>MEEGqc QA dataset report: {dataset_name}</h1>
           <p><strong>Generated:</strong> {generated}</p>
           <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Epoch label:</strong> epochs</p>
@@ -7957,7 +7957,7 @@ def _build_accumulators_for_runs(
     return acc_by_type
 
 
-def make_group_plots_meg_qc(
+def make_dataset_plots_meg_qc(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
     n_jobs: int = 1,
@@ -8013,7 +8013,7 @@ def make_group_plots_meg_qc(
     calculation_dir = Path(source_megqc_root) / "calculation"
     if not calculation_dir.exists() and derivatives_base is not None:
         original_megqc_root = os.path.join(
-            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+            dataset_path, "derivatives", "MEEGqc", *analysis_segments
         )
         original_calc_dir = Path(original_megqc_root) / "calculation"
         if original_calc_dir.exists():
@@ -8065,7 +8065,7 @@ def make_group_plots_meg_qc(
         )
         meg_report_dir = reports_dir / "meg"
         meg_report_dir.mkdir(parents=True, exist_ok=True)
-        meg_path = meg_report_dir / f"QA_group_report_{dataset_name}_meg.html"
+        meg_path = meg_report_dir / f"QA_dataset_report_{dataset_name}_meg.html"
         meg_path.write_text(meg_html, encoding="utf-8")
         print(f"___MEGqc___:   MEG report: {meg_path}")
 
@@ -8079,7 +8079,7 @@ def make_group_plots_meg_qc(
         )
         eeg_report_dir = reports_dir / "eeg"
         eeg_report_dir.mkdir(parents=True, exist_ok=True)
-        eeg_path = eeg_report_dir / f"QA_group_report_{dataset_name}_eeg.html"
+        eeg_path = eeg_report_dir / f"QA_dataset_report_{dataset_name}_eeg.html"
         eeg_path.write_text(eeg_html, encoding="utf-8")
         print(f"___MEGqc___:   EEG report: {eeg_path}")
 
@@ -8087,8 +8087,8 @@ def make_group_plots_meg_qc(
     meg_accs_check = {k: v for k, v in tab_accumulators.items()
                       if k in ("Combined (mag+grad)", "MAG", "GRAD")}
     if any(acc.run_count > 0 for acc in meg_accs_check.values()):
-        primary_path = reports_dir / "meg" / f"QA_group_report_{dataset_name}_meg.html"
+        primary_path = reports_dir / "meg" / f"QA_dataset_report_{dataset_name}_meg.html"
     else:
-        primary_path = reports_dir / "eeg" / f"QA_group_report_{dataset_name}_eeg.html"
+        primary_path = reports_dir / "eeg" / f"QA_dataset_report_{dataset_name}_eeg.html"
 
     return {"report": primary_path}

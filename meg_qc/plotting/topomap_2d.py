@@ -1,7 +1,7 @@
 """Shared interactive 2D flattened-topomap rendering for MEEGqc reports.
 
 This module centralizes the "classic" flattened topographic map so the subject
-report and all group reports render the same upright (nose-up), interpolated
+report and all dataset reports render the same upright (nose-up), interpolated
 view, for MEG (any manufacturer) and EEG montages. Two public entry points:
 
 - ``make_flat_topomap_figure`` — an interpolated scalar field with sensor

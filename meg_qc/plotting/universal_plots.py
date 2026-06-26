@@ -125,8 +125,8 @@ def _add_colormap_menu_3d(fig: go.Figure, trace_idx: int = 0) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared "Settings" tab rendering. Every report (subject, QA group, QC group and
-# multi-sample) renders the exact same elegant, self-contained snapshot so the
+# Shared "Settings" tab rendering. Every report (subject, QA dataset, QC dataset and
+# multi-dataset) renders the exact same elegant, self-contained snapshot so the
 # look stays consistent and the text always fits the report column.
 # ---------------------------------------------------------------------------
 
@@ -1775,7 +1775,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     # Keep natural (original) order for toggle button.
     data_matrix_natural = data_matrix.copy()
 
-    # Match group-level style: sort channels by robust channel summary (high→low).
+    # Match dataset-level style: sort channels by robust channel summary (high→low).
     sort_key = np.nanmedian(data_matrix, axis=1)
     sort_key = np.nan_to_num(sort_key, nan=-np.inf)
     sort_idx = np.argsort(sort_key)[::-1]

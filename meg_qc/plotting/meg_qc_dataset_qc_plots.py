@@ -1,14 +1,14 @@
 """Dataset-level QC plotting from Global Quality Index summary tables.
 
 This module builds an interactive HTML QC report from per-modality GQI TSVs:
-``summary_reports/group_metrics/meg/Global_Quality_Index_attempt_*_meg.tsv``
-``summary_reports/group_metrics/eeg/Global_Quality_Index_attempt_*_eeg.tsv``
+``summary_reports/group_metrics/meg/desc-GlobalQualityIndexAttempt*_meg.tsv``
+``summary_reports/group_metrics/eeg/desc-GlobalQualityIndexAttempt*_eeg.tsv``
 produced by the GQI calculation pipeline.  Legacy combined TSVs at the root
 ``group_metrics/`` level are also supported for backward compatibility.
 
 Public entrypoint
 -----------------
-``make_group_qc_plots_meg_qc(dataset_path, input_tsv=None, output_html=None,\n                              attempt=None, derivatives_base=None)``
+``make_dataset_qc_plots_meg_qc(dataset_path, input_tsv=None, output_html=None,\n                              attempt=None, derivatives_base=None)``
 """
 
 from __future__ import annotations
@@ -227,7 +227,8 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
 
 
 def _attempt_from_name(path: Path) -> Optional[int]:
-    match = re.search(r"attempt_(\d+)", path.name)
+    # Parses the attempt index from the BIDS-valid name desc-GlobalQualityIndexAttempt<N>.
+    match = re.search(r"Attempt(\d+)", path.name)
     return int(match.group(1)) if match else None
 
 
@@ -235,19 +236,14 @@ def _latest_attempt_tsv(group_metrics_dir: Path) -> Optional[Path]:
     """Find the latest GQI attempt TSV, scanning per-modality subdirs first.
 
     Looks in ``group_metrics/meg/`` and ``group_metrics/eeg/`` for
-    per-modality files (``Global_Quality_Index_attempt_*_{meg,eeg}.tsv``).
-    Falls back to legacy combined files in ``group_metrics/`` for backward
-    compatibility with older analysis runs.
+    per-modality files (``desc-GlobalQualityIndexAttempt*_{meg,eeg}.tsv``).
     """
     files: list = []
     # Per-modality subdirectories (new layout)
     for subdir in ("meg", "eeg"):
         d = group_metrics_dir / subdir
         if d.is_dir():
-            files.extend(d.glob("Global_Quality_Index_attempt_*.tsv"))
-    # Fallback: legacy combined files in root group_metrics/
-    if not files:
-        files = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
+            files.extend(d.glob("*GlobalQualityIndexAttempt*.tsv"))
     if not files:
         return None
     files.sort(key=lambda p: (_attempt_from_name(p) or -1, p.stat().st_mtime), reverse=True)
@@ -255,20 +251,13 @@ def _latest_attempt_tsv(group_metrics_dir: Path) -> Optional[Path]:
 
 
 def _all_attempt_tsvs(group_metrics_dir: Path, attempt: Optional[int] = None) -> List[Path]:
-    """Return all GQI TSVs for an attempt (or latest), from per-modality subdirs.
-
-    Falls back to legacy combined files in root group_metrics/ for backward
-    compatibility.
-    """
+    """Return all GQI TSVs for an attempt (or latest), from per-modality subdirs."""
     files: list = []
     # Per-modality subdirectories (new layout)
     for subdir in ("meg", "eeg"):
         d = group_metrics_dir / subdir
         if d.is_dir():
-            files.extend(d.glob("Global_Quality_Index_attempt_*.tsv"))
-    # Fallback: legacy combined files in root group_metrics/
-    if not files:
-        files = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
+            files.extend(d.glob("*GlobalQualityIndexAttempt*.tsv"))
     if not files:
         return []
 
@@ -318,7 +307,7 @@ def _resolve_input_paths(
     # external reports_dir.
     if not group_metrics_dir.exists() and derivatives_base is not None:
         original_megqc_root = os.path.join(
-            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+            dataset_path, "derivatives", "MEEGqc", *analysis_segments
         )
         original_summary_root = Path(original_megqc_root) / "summary_reports"
         original_group_metrics_dir = original_summary_root / "group_metrics"
@@ -328,7 +317,7 @@ def _resolve_input_paths(
             group_metrics_dir = original_group_metrics_dir
             config_dir = original_summary_root / "config"
             print(
-                "___MEGqc___: QC group report: Scenario C — "
+                "___MEGqc___: QC dataset report: Scenario C — "
                 f"reading GQI from original dataset: {group_metrics_dir}"
             )
 
@@ -338,13 +327,7 @@ def _resolve_input_paths(
             raise FileNotFoundError(f"Input TSV does not exist: {tsv_path}")
     else:
         if attempt is not None:
-            # Look in per-modality subdirs first, then fall back to root
             tsv_candidates = _all_attempt_tsvs(group_metrics_dir, attempt=attempt)
-            if not tsv_candidates:
-                # Legacy fallback: try the combined file at root level
-                legacy = group_metrics_dir / f"Global_Quality_Index_attempt_{attempt}.tsv"
-                if legacy.exists():
-                    tsv_candidates = [legacy]
             if not tsv_candidates:
                 raise FileNotFoundError(
                     f"Requested attempt {attempt} not found in {group_metrics_dir}"
@@ -354,13 +337,13 @@ def _resolve_input_paths(
             tsv_path = _latest_attempt_tsv(group_metrics_dir)
             if tsv_path is None:
                 raise FileNotFoundError(
-                    f"No Global_Quality_Index_attempt_*.tsv found in {group_metrics_dir}"
+                    f"No desc-GlobalQualityIndexAttempt*_*.tsv found in {group_metrics_dir}"
                 )
 
     resolved_attempt = _attempt_from_name(tsv_path)
     cfg_path = None
     if resolved_attempt is not None:
-        candidate = config_dir / f"global_quality_index_{resolved_attempt}.ini"
+        candidate = config_dir / f"desc-GlobalQualityIndexAttempt{resolved_attempt}_settings.ini"
         if candidate.exists():
             cfg_path = candidate
 
@@ -2702,7 +2685,7 @@ def _build_report_html(
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>QC group report {report_name}</title>
+  <title>QC dataset report {report_name}</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body {{
@@ -2946,7 +2929,7 @@ def _build_report_html(
     <section>
       <div class="report-header">
         <div>
-          <h1>MEEGqc QC group report: {report_name}</h1>
+          <h1>MEEGqc QC dataset report: {report_name}</h1>
           <p><strong>Generated:</strong> {generated}</p>
           <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Attempt selection:</strong> {html.escape(attempt_text)}</p>
@@ -3384,7 +3367,7 @@ def _build_report_html(
 # ---------------------------------------------------------------------------
 
 
-def make_group_qc_plots_meg_qc(
+def make_dataset_qc_plots_meg_qc(
     dataset_path: str,
     input_tsv: Optional[str] = None,
     output_html: Optional[str] = None,
@@ -3427,7 +3410,7 @@ def make_group_qc_plots_meg_qc(
             analysis_id=analysis_id,
         )
     except Exception as exc:
-        print(f"___MEGqc___: QC group report: unable to resolve inputs: {exc}")
+        print(f"___MEGqc___: QC dataset report: unable to resolve inputs: {exc}")
         return None
 
     report_html = _build_report_html(
@@ -3446,7 +3429,7 @@ def make_group_qc_plots_meg_qc(
         out_path = Path(output_html)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report_html, encoding="utf-8")
-        print(f"___MEGqc___: QC group report created: {out_path}")
+        print(f"___MEGqc___: QC dataset report created: {out_path}")
     else:
         # Only per-modality reports; no combined agnostic report at top level
         out_path = None
@@ -3490,7 +3473,7 @@ def make_group_qc_plots_meg_qc(
         )
         meg_dir = bundle.reports_dir / "meg"
         meg_dir.mkdir(parents=True, exist_ok=True)
-        meg_path = meg_dir / f"QC_group_report_{bundle.dataset_name}{_sfx}_meg.html"
+        meg_path = meg_dir / f"QC_dataset_report_{bundle.dataset_name}{_sfx}_meg.html"
         meg_path.write_text(meg_html, encoding="utf-8")
         print(f"___MEGqc___:   MEG QC report: {meg_path}")
 
@@ -3504,7 +3487,7 @@ def make_group_qc_plots_meg_qc(
         )
         eeg_dir = bundle.reports_dir / "eeg"
         eeg_dir.mkdir(parents=True, exist_ok=True)
-        eeg_path = eeg_dir / f"QC_group_report_{bundle.dataset_name}{_sfx}_eeg.html"
+        eeg_path = eeg_dir / f"QC_dataset_report_{bundle.dataset_name}{_sfx}_eeg.html"
         eeg_path.write_text(eeg_html, encoding="utf-8")
         print(f"___MEGqc___:   EEG QC report: {eeg_path}")
 
@@ -3512,13 +3495,13 @@ def make_group_qc_plots_meg_qc(
         return out_path
     # Return primary per-modality path
     if has_meg:
-        return bundle.reports_dir / "meg" / f"QC_group_report_{bundle.dataset_name}{_sfx}_meg.html"
+        return bundle.reports_dir / "meg" / f"QC_dataset_report_{bundle.dataset_name}{_sfx}_meg.html"
     if has_eeg:
-        return bundle.reports_dir / "eeg" / f"QC_group_report_{bundle.dataset_name}{_sfx}_eeg.html"
+        return bundle.reports_dir / "eeg" / f"QC_dataset_report_{bundle.dataset_name}{_sfx}_eeg.html"
     return None
 
 
-def make_group_qc_plots_multi_meg_qc(
+def make_dataset_qc_plots_multi_meg_qc(
     dataset_paths: Sequence[str],
     output_html: Optional[str] = None,
     attempt: Optional[int] = None,
@@ -3621,7 +3604,7 @@ def make_group_qc_plots_multi_meg_qc(
         )
         meg_dir = base_dir / "meg"
         meg_dir.mkdir(parents=True, exist_ok=True)
-        meg_path = meg_dir / f"QC_group_report_multi{attempt_suffix}_{run_id}_meg.html"
+        meg_path = meg_dir / f"QC_dataset_report_multi{attempt_suffix}_{run_id}_meg.html"
         meg_path.write_text(meg_html, encoding="utf-8")
         print(f"___MEGqc___:   MEG QC multi report: {meg_path}")
         if out_path is None:
@@ -3639,7 +3622,7 @@ def make_group_qc_plots_multi_meg_qc(
         )
         eeg_dir = base_dir / "eeg"
         eeg_dir.mkdir(parents=True, exist_ok=True)
-        eeg_path = eeg_dir / f"QC_group_report_multi{attempt_suffix}_{run_id}_eeg.html"
+        eeg_path = eeg_dir / f"QC_dataset_report_multi{attempt_suffix}_{run_id}_eeg.html"
         eeg_path.write_text(eeg_html, encoding="utf-8")
         print(f"___MEGqc___:   EEG QC multi report: {eeg_path}")
         if out_path is None:

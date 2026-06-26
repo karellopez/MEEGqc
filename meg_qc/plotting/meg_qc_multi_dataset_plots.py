@@ -1,8 +1,8 @@
-"""Multi-sample QA group reporting for MEGqc derivatives.
+"""Multi-sample QA dataset reporting for MEGqc derivatives.
 
 This module builds one HTML report that compares two or more datasets while
 reusing the same derivative-loading and run-level aggregation logic as the
-single-dataset group report.
+single-dataset report.
 
 Design rules implemented here
 -----------------------------
@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
-from meg_qc.plotting.meg_qc_group_plots import (
+from meg_qc.plotting.meg_qc_dataset_plots import (
     ChTypeAccumulator,
     TopomapPayload,
     _build_accumulators_for_runs,
@@ -154,7 +154,7 @@ def _collect_sample_bundle(
     calculation_dir = Path(source_megqc_root) / "calculation"
     if not calculation_dir.exists() and derivatives_base is not None:
         original_megqc_root = os.path.join(
-            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+            dataset_path, "derivatives", "MEEGqc", *analysis_segments
         )
         original_calc_dir = Path(original_megqc_root) / "calculation"
         if original_calc_dir.exists():
@@ -1174,7 +1174,7 @@ def _build_multi_summary_distributions_section(
     is_combined: bool,
     tab_token: str,
 ) -> str:
-    """Summary distributions for multi-sample QA (pooled + per-dataset subtabs)."""
+    """Summary distributions for multi-dataset QA (pooled + per-dataset subtabs)."""
     df_all = _tab_dataframe(bundles, tab_name)
     if df_all.empty:
         return "<section><h2>Summary distributions</h2><p>No run-level summaries are available.</p></section>"
@@ -1427,7 +1427,7 @@ def _build_tab_content(
     return _build_subtabs_html(f"multi-main-{tab_token}", sections, level=1)
 
 
-def _build_multi_sample_report_html(
+def _build_multi_dataset_report_html(
     bundles: Sequence[SampleBundle],
     tab_order: Sequence[str],
     modality_label: str = "",
@@ -1476,7 +1476,7 @@ def _build_multi_sample_report_html(
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>QA multi-sample report{title_suffix}</title>
+  <title>QA multi-dataset report{title_suffix}</title>
   <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
   <style>
     body {{
@@ -1854,7 +1854,7 @@ def _build_multi_sample_report_html(
     <section>
       <div class=\"report-header\">
         <div>
-          <h1>MEEGqc QA multi-sample report{title_suffix}</h1>
+          <h1>MEEGqc QA multi-dataset report{title_suffix}</h1>
           <p><strong>Generated:</strong> {generated}</p>
           <p><strong>MEEGqc version:</strong> {version}</p>
           <p><strong>Datasets:</strong> {sample_names}</p>
@@ -2389,7 +2389,7 @@ def _build_multi_sample_report_html(
 """
 
 
-def make_multi_sample_group_plots_meg_qc(
+def make_multi_dataset_plots_meg_qc(
     dataset_paths: Sequence[str],
     derivatives_bases: Optional[Sequence[Optional[str]]] = None,
     output_report_path: Optional[str] = None,
@@ -2469,20 +2469,20 @@ def make_multi_sample_group_plots_meg_qc(
 
     result = {}
 
-    # ── MEG multi-sample report ───────────────────────────────────────
+    # ── MEG multi-dataset report ───────────────────────────────────────
     if len(meg_bundles) >= 2:
         # Include MEG tabs that any bundle provides — tabs with missing data in
         # some bundles will show a "no data" placeholder rather than disappearing.
         meg_shared = [t for t in meg_tabs_all
                       if any(_bundle_has_modality(b, t) for b in meg_bundles)]
         if meg_shared:
-            meg_html = _build_multi_sample_report_html(meg_bundles, meg_shared, modality_label="MEG")
+            meg_html = _build_multi_dataset_report_html(meg_bundles, meg_shared, modality_label="MEG")
             meg_dir = primary_reports_dir / "meg"
             meg_dir.mkdir(parents=True, exist_ok=True)
             if output_report_path is not None:
                 meg_path = Path(output_report_path).parent / "meg" / (Path(output_report_path).stem + "_meg.html")
             else:
-                meg_path = meg_dir / f"QA_multi_sample_report_{run_id}_meg.html"
+                meg_path = meg_dir / f"QA_multi_dataset_report_{run_id}_meg.html"
             meg_path.parent.mkdir(parents=True, exist_ok=True)
             meg_path.write_text(meg_html, encoding="utf-8")
             result["meg_report"] = meg_path
@@ -2496,15 +2496,15 @@ def make_multi_sample_group_plots_meg_qc(
     elif len(meg_bundles) == 1:
         print(f"___MEGqc___: Multi-sample QA: only one MEG dataset ({meg_bundles[0].sample_id}), skipping MEG comparison.")
 
-    # ── EEG multi-sample report ───────────────────────────────────────
+    # ── EEG multi-dataset report ───────────────────────────────────────
     if len(eeg_bundles) >= 2:
-        eeg_html = _build_multi_sample_report_html(eeg_bundles, eeg_tabs_all, modality_label="EEG")
+        eeg_html = _build_multi_dataset_report_html(eeg_bundles, eeg_tabs_all, modality_label="EEG")
         eeg_dir = primary_reports_dir / "eeg"
         eeg_dir.mkdir(parents=True, exist_ok=True)
         if output_report_path is not None:
             eeg_path = Path(output_report_path).parent / "eeg" / (Path(output_report_path).stem + "_eeg.html")
         else:
-            eeg_path = eeg_dir / f"QA_multi_sample_report_{run_id}_eeg.html"
+            eeg_path = eeg_dir / f"QA_multi_dataset_report_{run_id}_eeg.html"
         eeg_path.parent.mkdir(parents=True, exist_ok=True)
         eeg_path.write_text(eeg_html, encoding="utf-8")
         result["eeg_report"] = eeg_path
