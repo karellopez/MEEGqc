@@ -23,6 +23,10 @@ Every dataset is kept in its ORIGINAL format. Cropping means re-saving, so:
                            are); a res4 MNE cannot parse is skipped (MEEGqc
                            could not read it either).
 
+A few recordings listed in ``_COMPLETE_FIXTURES`` are additionally copied at
+their FULL length (no crop) into a ``*_complete`` dataset, for the tests that
+need the whole signal (head movement, event-based epoching). These are large.
+
 Generator-only dependencies (NOT runtime deps of MEEGqc): ``edfio``,
 ``eeglabio``, ``pybv`` (plus ``mne`` and ``pandas``).
 
@@ -148,6 +152,16 @@ _STEM_SIDECARS = ("_channels.tsv", "_events.tsv", "_electrodes.tsv")
 _SES_SIDECARS = ("coordsystem.json",)
 _ROOT_FILES = ("dataset_description.json", "participants.tsv", "participants.json",
                "README", "README.md", "CHANGES", "task-*_events.json")
+
+# Optional "complete" (uncropped) fixtures. A few tests need the full signal that
+# a 10 s crop cannot provide (head movement needs the whole cHPI trace, and
+# event-based epoching needs all events). Each entry is copied VERBATIM (no crop)
+# into its own dataset, so the recording and its sidecars stay exactly as in the
+# source. These are large; keep the list minimal.
+# (source dataset, subject, task, output dataset name)
+_COMPLETE_FIXTURES = (
+    ("ds_meg_example_1", "sub-009", "deduction", "ds_meg_example_1_complete"),
+)
 
 
 def _read_raw(path: str):
@@ -308,6 +322,70 @@ def _process_dataset(ds_dir: str, out_ds: str, exts: tuple[str, ...],
                             "error": str(exc)})
 
 
+def _emit_complete(meg_root: str, out: str, records: list) -> None:
+    """Copy each recording in ``_COMPLETE_FIXTURES`` at FULL length (no crop).
+
+    The recording and every sidecar that shares its BIDS stem (plus the
+    session-scoped coordsystem and the dataset root files) are copied verbatim,
+    so the result is the untouched, complete signal rather than a 10 s crop.
+    """
+    for src_ds, sub, task, out_name in _COMPLETE_FIXTURES:
+        ds_dir = os.path.join(meg_root, src_ds)
+        hits = sorted(
+            h
+            for ext in _MEG_EXTS
+            for h in glob(os.path.join(ds_dir, sub, "**", "meg", f"*_meg{ext}"),
+                          recursive=True)
+            if (os.sep + "derivatives" + os.sep) not in h
+            and f"_task-{task}_" in os.path.basename(h)
+        )
+        if not hits:
+            print(f"[COMPLETE] {out_name}: no {sub} task-{task} recording in "
+                  f"{src_ds}; skipping")
+            continue
+        rec = hits[0]
+        src_dir = os.path.dirname(rec)                    # .../sub-XXX/ses-Y/meg
+        base = os.path.basename(rec)
+        stem = base
+        for e in _MEG_EXTS:
+            if stem.lower().endswith("_meg" + e):
+                stem = stem[: -len("_meg" + e)]           # sub-XXX_ses-Y_task-..._run-N
+                break
+        out_ds = os.path.join(out, out_name)
+        rel_dir = os.path.relpath(src_dir, ds_dir)        # sub-XXX/ses-Y/meg
+        out_rec_dir = os.path.join(out_ds, rel_dir)
+        os.makedirs(out_rec_dir, exist_ok=True)
+        # dataset root files
+        for pat in _ROOT_FILES:
+            for s in glob(os.path.join(ds_dir, pat)):
+                if os.path.isfile(s):
+                    shutil.copy2(s, os.path.join(out_ds, os.path.basename(s)))
+        # the recording (incl. any FIF split parts) + this task's sidecars, verbatim
+        for s in sorted(glob(os.path.join(src_dir, stem + "*"))):
+            if os.path.isfile(s):
+                shutil.copy2(s, os.path.join(out_rec_dir, os.path.basename(s)))
+        # session-scoped coordsystem
+        for s in glob(os.path.join(src_dir, "*coordsystem.json")):
+            shutil.copy2(s, os.path.join(out_rec_dir, os.path.basename(s)))
+        ses = next((p for p in rel_dir.split(os.sep) if p.startswith("ses-")), None)
+        try:
+            raw, _ = _read_raw(rec)
+            dur, nch, sf = float(raw.times[-1]), len(raw.ch_names), float(raw.info["sfreq"])
+        except Exception as exc:  # noqa: BLE001
+            dur = nch = sf = None
+            print(f"  (could not read header for manifest: {exc})")
+        records.append({
+            "dataset": out_name, "subject": sub, "session": ses, "modality": "meg",
+            "source_format": os.path.splitext(rec)[1].lstrip("."), "converted_from": None,
+            "written": os.path.relpath(os.path.join(out_rec_dir, base), out),
+            "complete": True,
+            "seconds": round(dur, 3) if dur is not None else None,
+            "n_channels": nch, "sfreq": sf,
+        })
+        note = f"({dur:.0f}s, {nch} ch)" if dur is not None else ""
+        print(f"[COMPLETE] {out_name}: {sub} task-{task} copied uncropped {note}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -332,6 +410,9 @@ def main() -> int:
             print(f"[{tag}] {name}")
             _process_dataset(ds_dir, os.path.join(args.out, name), exts,
                              args.seconds, args.max_subs, records)
+
+    # Additional uncropped datasets for tests that need the full signal.
+    _emit_complete(args.meg_root, args.out, records)
 
     ok = [r for r in records if "error" not in r]
     manifest = {

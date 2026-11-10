@@ -819,8 +819,8 @@ class SettingsEditorDialog(QDialog):
         ("GENERAL", "PTP_manual"): "PTP_manual",
         ("GENERAL", "ECG"): "ECG",
         ("GENERAL", "EOG"): "EOG",
-        ("GENERAL", "Head"): "Head_movement",
         ("GENERAL", "Muscle"): "Muscle",
+        ("GENERAL", "Head"): "Head_movement",
         ("GlobalQualityIndex", "compute_gqi"): "GlobalQualityIndex",
     }
 
