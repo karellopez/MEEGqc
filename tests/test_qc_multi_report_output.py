@@ -6,6 +6,23 @@ import pytest
 from meg_qc.plotting.meg_qc_dataset_qc_plots import make_dataset_qc_plots_multi_meg_qc
 
 
+@pytest.mark.parametrize("names", [("shared", "shared"), ("shared", "SHARED")])
+def test_literal_multi_dataset_qc_rejects_colliding_names_before_writing(tmp_path, names):
+    datasets = []
+    for parent, name in zip(("study-a", "study-b"), names):
+        dataset = tmp_path / parent / name
+        dataset.mkdir(parents=True)
+        datasets.append(str(dataset))
+    output = tmp_path / "external"
+
+    with pytest.raises(ValueError, match="unique dataset directory names"):
+        make_dataset_qc_plots_multi_meg_qc(
+            datasets, derivatives_base=str(output), output_layout="literal",
+            analysis_mode="non-profile",
+        )
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("explicit_output", [False, True], ids=["default", "explicit"])
 def test_multi_dataset_qc_report_output_paths(tmp_path, explicit_output):
     datasets = []
