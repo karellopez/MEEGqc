@@ -68,6 +68,8 @@ def browser() -> str:
 
 
 def report(html: str, png: str, width: int = 1440, height: int = 2400) -> None:
+    # Chrome reads a relative --screenshot path from its own folder.
+    png = str(Path(png).resolve())
     profile = tempfile.mkdtemp(prefix="meegqc_shot_profile_")
     try:
         # Software WebGL (SwiftShader): with --disable-gpu every plotly
