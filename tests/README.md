@@ -67,7 +67,11 @@ sampling rate) and drives the parametrized tests.
 ### Uploading the bundle to a GitHub Release
 
 ```bash
-tar -czf meegqc_test_data.tar.gz -C /tmp meegqc_test_data
+# On macOS, keep Apple metadata out of the archive: without these flags tar
+# adds a hidden ._<name> file for every file, which become real files (459
+# of them in v1) when the bundle is unpacked on Linux or Windows.
+COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --exclude='.DS_Store' \
+    -czf meegqc_test_data.tar.gz -C /tmp meegqc_test_data
 
 # create (or reuse) the release and attach the asset (public repo -> CI can
 # curl it without auth):

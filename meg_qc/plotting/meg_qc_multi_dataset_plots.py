@@ -29,6 +29,7 @@ import plotly.graph_objects as go
 
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
+from meg_qc.plotting.reference_sources import contribution_html, describe_source
 from meg_qc.plotting.meg_qc_dataset_plots import (
     ChTypeAccumulator,
     TopomapPayload,
@@ -1367,7 +1368,7 @@ def _summary_distribution_dataset_cards_html(
     )
 
 
-def _build_multi_megnet_provenance_section(
+def _build_multi_reference_provenance_section(
     bundles: Sequence[SampleBundle],
     tab_name: str,
 ) -> str:
@@ -1378,12 +1379,6 @@ def _build_multi_megnet_provenance_section(
     if not any(c in df_all.columns for c in ("ecg_signal_source", "eog_signal_source")):
         return ""
 
-    nice = {
-        "recorded": "recorded channel",
-        "mne_reconstructed": "reconstructed by MNE",
-        "megnet": "MEGnet synthetic",
-        "correlation_megnet": "MEGnet synthetic",
-    }
     sources = sorted(
         {str(v) for c in ("ecg_signal_source", "eog_signal_source") if c in df_all.columns
          for v in df_all[c].astype(str).unique() if str(v) not in ("n/a", "", "None")}
@@ -1405,7 +1400,7 @@ def _build_multi_megnet_provenance_section(
                 cells.append("<td>n/a</td>")
                 continue
             counts = vals.value_counts()
-            parts = [f"{nice.get(str(s), str(s))} {int(n)} ({100.0*int(n)/total:.0f}%)"
+            parts = [f"{describe_source(s, short=True)} {int(n)} ({100.0*int(n)/total:.0f}%)"
                      for s, n in counts.items()]
             cells.append("<td>" + " &nbsp;·&nbsp; ".join(parts) + f" <em>[n={total}]</em></td>")
         return "<tr>" + "".join(cells) + "</tr>"
@@ -1417,33 +1412,14 @@ def _build_multi_megnet_provenance_section(
             continue
         rows.append(_row(bundle.sample_id, dff))
 
-    # MEGnet availability across the whole collection: without this a run where
-    # MEGnet failed everywhere looks the same as one where it was never on.
+    # Each reference plugin's use across the whole collection: without this a
+    # run where a plugin (e.g. MEGnet) failed everywhere looks the same as one
+    # where it was never on.
     base_all = (df_all.drop_duplicates(subset=["run_key", "sample_id"])
                 if {"run_key", "sample_id"}.issubset(df_all.columns) else df_all)
-    n_total = int(base_all.shape[0])
-    megnet_used = 0
-    for c in ("ecg_signal_source", "eog_signal_source"):
-        if c in base_all.columns:
-            megnet_used = max(
-                megnet_used,
-                int(base_all[c].astype(str).isin(["megnet", "correlation_megnet"]).sum()))
-    pct = (100.0 * megnet_used / n_total) if n_total else 0.0
-    n_ds_with = 0
-    if "sample_id" in base_all.columns:
-        for _sid, g in base_all.groupby(base_all["sample_id"].astype(str)):
-            if any(c in g.columns and g[c].astype(str).isin(["megnet", "correlation_megnet"]).any()
-                   for c in ("ecg_signal_source", "eog_signal_source")):
-                n_ds_with += 1
-    avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
-             f"<strong>{megnet_used}</strong> of {n_total} recordings ({pct:.0f}%), across "
-             f"<strong>{n_ds_with}</strong> of {len(bundles)} datasets. "
-             + ("MEGnet produced nothing usable in this collection - either it was disabled, its "
-                "model weights are missing (run <code>megnet_init</code>), the recordings are "
-                "shorter than 60 s, or the systems have no magnetometers."
-                if megnet_used == 0 else
-                "Recordings without it fell back to a recorded channel or an MNE reconstruction.")
-             + "</p>")
+    avail = contribution_html(base_all, ("ecg_signal_source", "eog_signal_source"),
+                              scope="in this collection", group_col="sample_id",
+                              n_groups=len(bundles))
 
     return (
         "<section><h2>ECG/EOG signal provenance</h2>" + avail +
@@ -1453,7 +1429,7 @@ def _build_multi_megnet_provenance_section(
         "</tbody></table>"
         "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG metrics are "
         "computed against a reference signal. Ideally that is a recorded channel; when none exists "
-        "MEEGqc reconstructs one from the MEG sensors, and MEGnet can supply a synthetic component "
+        "MEEGqc reconstructs one from the MEG sensors, and a plugin such as MEGnet can supply a synthetic component "
         "instead. Values computed against reconstructed or synthetic references are not directly "
         "comparable with those from a recorded channel, so when comparing datasets check that they "
         "share a provenance before reading anything into a difference in their ECG/EOG dots."
@@ -1733,10 +1709,10 @@ def _build_tab_content(
     ]
 
     # ECG/EOG provenance: how many recordings used a real channel, an MNE
-    # reconstruction, or a MEGnet synthetic component - per dataset and pooled.
-    # Without this, MEGnet is invisible above the single-recording report even
+    # reconstruction, or a plugin's synthetic component - per dataset and pooled.
+    # Without this, a plugin such as MEGnet is invisible above the single-recording report even
     # though the calculation module records it for every recording.
-    prov_html = _build_multi_megnet_provenance_section(bundles, tab_name)
+    prov_html = _build_multi_reference_provenance_section(bundles, tab_name)
     if prov_html:
         sections.append(("ECG/EOG signal provenance", prov_html))
 
@@ -2737,9 +2713,9 @@ def make_multi_dataset_plots_meg_qc(
         Number of parallel workers used for subject-level run loading within
         each dataset. Use ``1`` for sequential mode, or ``-1`` for all cores.
     analysis_mode
-        Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
+        Analysis root selection mode (``non-profile``, ``new-profile``, ``reuse-profile``, ``latest-profile``).
     analysis_id
-        Profile ID used with ``analysis_mode='reuse'``.
+        Profile ID used with ``analysis_mode='reuse-profile'``.
     output_layout
         External output layout used to resolve every entry in
         ``derivatives_bases``.

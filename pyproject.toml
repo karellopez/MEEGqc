@@ -42,8 +42,13 @@ classifiers = [
 dependencies = [
     "ancpbids>=0.3,<=0.3.0",
     "prompt_toolkit>=3.0,<=3.0.52",
-    "mne>=1.6,<=1.12.0",
-    "megnet-neuro",
+    # Python 3.11+ need MNE 1.13.1 or newer: older MNE cannot read EEGLAB files
+    # that hold MATLAB objects once SciPy 1.18 (Python 3.12+) is installed.
+    # MNE 1.13 needs Python 3.11, and Python 3.10 cannot install that SciPy.
+    "mne>=1.6,<=1.12.1; python_version < '3.11'",
+    "mne>=1.13.1,<=1.13.2; python_version >= '3.11'",
+    # MEGnet is an optional plugin (plugins/meegqc-megnet), installed with
+    # `meegqc-plugins install megnet`; it brings PyTorch and Keras.
     "pandas>=2.0,<=3.0.2",
     "plotly>=5.18,<=6.7.0",
     "joblib>=1.3,<=1.5.3",
@@ -70,6 +75,7 @@ meegqc = "meg_qc.miscellaneous.GUI.megqcGUI:run_megqc_gui"
 run-meegqc = "meg_qc.test:run_megqc"
 run-meegqc-plotting = "meg_qc.test:get_plots"
 get-meegqc-config = "meg_qc.test:get_config"
+meegqc-plugins = "meg_qc.plugins.cli:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -91,3 +97,8 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["meg_qc*"]
 
+[tool.pytest.ini_options]
+# A passing test's tmp_path is deleted as soon as it ends; a failing test's is
+# kept for inspection. Real-data tests run MEEGqc on whole datasets and write
+# their reports there, which reached about 7 GB per Python when all were kept.
+tmp_path_retention_policy = "failed"

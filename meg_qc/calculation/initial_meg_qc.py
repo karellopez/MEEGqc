@@ -12,9 +12,41 @@ import copy
 import warnings
 from typing import List
 from meg_qc.calculation.objects import QC_derivative, MEG_channel, QC_channel
+from meg_qc.plugins.registry import settings_for_run as plugin_settings_for_run
 
 # Canonical set of channel types the package can process.
 SUPPORTED_CH_TYPES = {'mag', 'grad', 'eeg'}
+
+
+def _report_ignored_settings(config: configparser.ConfigParser) -> None:
+    """Name the settings this MEEGqc does not read, so a changed behaviour is
+    never silent: a typo, a plugin that is not installed, or an option that
+    moved (MEGnet's megnet_* keys in [ECG]/[EOG] are now its plugin's
+    [MEGNET] section)."""
+    from meg_qc.plugins.registry import plugins as installed_plugins
+
+    known = configparser.ConfigParser()
+    known.read(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'settings', 'settings.ini'))
+    plugin_sections = {p.settings_section for p in installed_plugins() if p.settings_section}
+    shared = set(config.defaults())
+    ignored = []
+    for section in config.sections():
+        if section in plugin_sections:
+            continue
+        if section not in known:
+            ignored.append(f'[{section}]')
+            continue
+        ignored += [f'[{section}] {key}' for key in config[section]
+                    if key not in known[section] and key not in shared]
+    if not ignored:
+        return
+    print('___MEGqc___: These settings are not used by this MEEGqc and are ignored: '
+          + ', '.join(ignored) + '.')
+    if any('megnet' in item.lower() for item in ignored):
+        print('___MEGqc___: MEGnet is a plugin now: install it with '
+              '`meegqc-plugins install megnet`; its options are its [MEGNET] section '
+              '(ecg/eog = off, fallback, independent or both).')
 
 
 def get_all_config_params(config_file_path: str):
@@ -198,13 +230,6 @@ def get_all_config_params(config_file_path: str):
         ecg_fixed_ch = [name.strip() for name in ecg_fixed_ch.split(',') if name.strip()]
         all_qc_params['ECG'] = dict({
             'drop_bad_ch': ecg_section.getboolean('drop_bad_ch'),
-            'megnet_fallback': ecg_section.getboolean('megnet_fallback', fallback=False),
-            'megnet_independent': ecg_section.getboolean(
-                'megnet_independent',
-                fallback=ecg_section.getboolean('megnet_indepent', fallback=False),
-            ),
-            'megnet_lowpass_apply': ecg_section.getboolean('megnet_lowpass_apply', fallback=True),
-            'megnet_lowpass_h_freq': ecg_section.getfloat('megnet_lowpass_h_freq', fallback=40.0),
             'n_breaks_bursts_allowed_per_10min': ecg_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': ecg_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': ecg_section.getfloat('norm_lvl'),
@@ -217,13 +242,6 @@ def get_all_config_params(config_file_path: str):
         eog_fixed_ch = eog_section.get('fixed_channel_names', '')
         eog_fixed_ch = [name.strip() for name in eog_fixed_ch.split(',') if name.strip()]
         all_qc_params['EOG'] = dict({
-            'megnet_fallback': eog_section.getboolean('megnet_fallback', fallback=False),
-            'megnet_independent': eog_section.getboolean(
-                'megnet_independent',
-                fallback=eog_section.getboolean('megnet_indepent', fallback=False),
-            ),
-            'megnet_lowpass_apply': eog_section.getboolean('megnet_lowpass_apply', fallback=True),
-            'megnet_lowpass_h_freq': eog_section.getfloat('megnet_lowpass_h_freq', fallback=20.0),
             'n_breaks_bursts_allowed_per_10min': eog_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': eog_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': eog_section.getfloat('norm_lvl'),
@@ -257,46 +275,9 @@ def get_all_config_params(config_file_path: str):
             eeg_settings['montage'] = eeg_sec.get('montage', 'auto').strip()
         all_qc_params['EEG_settings'] = eeg_settings
 
-        # ── MEGnet settings (optional section) ──────────────────────────
-        megnet_section = config['MEGNET'] if 'MEGNET' in config else None
-        all_qc_params['MEGNET'] = dict({
-            'megnet_optional_dependency': (
-                megnet_section.getboolean('megnet_optional_dependency', fallback=True)
-                if megnet_section else True
-            ),
-            'probability_threshold': (
-                megnet_section.getfloat('probability_threshold', fallback=9.0)
-                if megnet_section else 9.0
-            ),
-            'combine_components': (
-                megnet_section.getboolean('combine_components', fallback=False)
-                if megnet_section else False
-            ),
-            'max_components_per_class': (
-                megnet_section.getint('max_components_per_class', fallback=1)
-                if megnet_section else 1
-            ),
-            'save_full_ica_timeseries': (
-                megnet_section.getboolean('save_full_ica_timeseries', fallback=False)
-                if megnet_section else False
-            ),
-            'megnet_component_strategy': (
-                megnet_section.get('megnet_component_strategy', fallback='top1').strip()
-                if megnet_section else 'top1'
-            ),
-            'megnet_ecg_class': (
-                megnet_section.getint('megnet_ecg_class', fallback=2)
-                if megnet_section else 2
-            ),
-            'megnet_eog_primary_class': (
-                megnet_section.getint('megnet_eog_primary_class', fallback=1)
-                if megnet_section else 1
-            ),
-            'megnet_eog_secondary_class': (
-                megnet_section.getint('megnet_eog_secondary_class', fallback=3)
-                if megnet_section else 3
-            ),
-        })
+        # ── Plugins: each may own one section of settings.ini ─────────────
+        all_qc_params['PLUGINS'] = plugin_settings_for_run(config)
+        _report_ignored_settings(config)
 
         gqi_section = config['GlobalQualityIndex']
 
@@ -968,7 +949,7 @@ def change_ch_type_CTF(raw, channels):
     return channels, raw
 
 
-def load_data(file_path):
+def load_data(file_path, preload: bool = True):
     """
     Load MEG or EEG data from a file.
 
@@ -976,6 +957,9 @@ def load_data(file_path):
     ----------
     file_path : str
         Path to the data file (FIF, CTF .ds, EDF, BDF, BrainVision, EEGLAB, EGI, Neuroscan).
+    preload : bool
+        Read the data into memory (the default). FIF files are always read
+        lazily; ``False`` reads only the header of the other formats too.
 
     Returns
     -------
@@ -1049,7 +1033,7 @@ def load_data(file_path):
 
         print("___MEGqc___: ", "Loading CTF data...")
         try:
-            raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
+            raw = mne.io.read_raw_ctf(file_path, preload=preload, verbose='ERROR')
         except (OSError, RuntimeError) as ctf_exc:
             # MNE walks the CTF system-clock channel to decide how many samples
             # are valid and gives up on the whole recording if that channel is
@@ -1058,7 +1042,7 @@ def load_data(file_path):
             # this mirrors the MaxShield retry the FIF branch already does.
             print(f"___MEGqc___: CTF read failed ({ctf_exc}); "
                   f"retrying with system_clock='ignore'...")
-            raw = mne.io.read_raw_ctf(file_path, preload=True,
+            raw = mne.io.read_raw_ctf(file_path, preload=preload,
                                       system_clock='ignore', verbose='ERROR')
         print(f"___MEGqc___: Recording duration: {raw.times[-1] / 60:.2f} min")
 
@@ -1144,37 +1128,37 @@ def load_data(file_path):
     # ──── EEG FORMATS ──────────────────────────────────────────────────────
     elif fp_lower.endswith('.edf'):
         print("___MEGqc___: Loading EDF data...")
-        raw = mne.io.read_raw_edf(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_edf(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
 
     elif fp_lower.endswith('.bdf'):
         print("___MEGqc___: Loading BDF data...")
-        raw = mne.io.read_raw_bdf(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_bdf(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
 
     elif fp_lower.endswith('.vhdr'):
         print("___MEGqc___: Loading BrainVision data...")
-        raw = mne.io.read_raw_brainvision(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_brainvision(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
 
     elif fp_lower.endswith('.set'):
         print("___MEGqc___: Loading EEGLAB data...")
-        raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_eeglab(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
 
     elif os.path.isdir(file_path) and fp_lower.endswith('.mff'):
         print("___MEGqc___: Loading EGI/MFF data...")
-        raw = mne.io.read_raw_egi(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_egi(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
 
     elif fp_lower.endswith('.cnt'):
         print("___MEGqc___: Loading Neuroscan CNT data...")
-        raw = mne.io.read_raw_cnt(file_path, preload=True, verbose='ERROR')
+        raw = mne.io.read_raw_cnt(file_path, preload=preload, verbose='ERROR')
         meg_system = 'EEG'
         modality = 'eeg'
     # ──── END EEG FORMATS ──────────────────────────────────────────────────

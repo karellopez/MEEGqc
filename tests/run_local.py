@@ -12,13 +12,13 @@ This is a convenience runner (not a pytest test module). It:
 
 Included test modules
 ---------------------
-  tests/realdata/test_megnet.py   - MEGnet pipeline integration (ECG/EOG)
+  tests/realdata/test_megnet_plugin.py - MEGnet plugin integration (ECG/EOG)
   tests/realdata/test_calculation.py, test_output_completeness.py, etc.
 
 Usage
 -----
     python tests/run_local.py                              # the whole suite
-    python tests/run_local.py tests/realdata/test_megnet.py  # MEGnet only
+    python tests/run_local.py tests/realdata/test_megnet_plugin.py  # MEGnet only
     python tests/run_local.py tests/gui -v                 # forward to pytest
     python tests/run_local.py -k ds007338                  # pick tests by id
 

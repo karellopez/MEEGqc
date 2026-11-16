@@ -33,9 +33,10 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSlider, QSplitter, QScrollArea, QListWidget, QListWidgetItem,
     QLineEdit, QProgressBar, QColorDialog, QApplication, QToolTip,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSettings, QThread, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QThread, pyqtSlot
 from PyQt6.QtGui import QColor, QCursor, QPalette
 
+from ..settings_store import settings_store
 from .annotation_manager import (
     AnnotationManager, AnnotationSet, EpochAnnotation, EventMarker,
 )
@@ -196,7 +197,7 @@ class TimeSeriesWidget(QWidget):
         self._active_worker: Optional[_LoadWorker] = None
 
         # Preferences
-        self._settings = QSettings("ANCP", "MEEGqc_Viewer")
+        self._settings = settings_store("MEEGqc_Viewer")
         self._dark_plot = self._settings.value("viewer/dark_plot", False, type=bool)
 
         self._build_ui()

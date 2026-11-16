@@ -113,7 +113,8 @@ except ImportError:
     HAS_NUMBA = False
 # PTP auto (MNE's annotate_amplitude) has been removed from the pipeline —
 # the manual PTP implementation is more reliable and better integrated.
-from meg_qc.calculation.metrics.ECG_EOG_meg_qc import (ECG_meg_qc, EOG_meg_qc, compute_megnet_outputs_for_file,)
+from meg_qc.calculation.metrics.ECG_EOG_meg_qc import (ECG_meg_qc, EOG_meg_qc,)
+from meg_qc.calculation.references import compute_references, recording_as_recorded
 from meg_qc.calculation.metrics.Head_meg_qc import HEAD_movement_meg_qc
 from meg_qc.calculation.metrics.muscle_meg_qc import MUSCLE_meg_qc
 
@@ -132,7 +133,7 @@ from meg_qc.output_paths import (
 )
 from meg_qc.calculation.resource_budget import (
     effective_jobs, recording_size_bytes,
-    DEFAULT_EXPANSION, DEFAULT_MEM_FRACTION, DEFAULT_MEM_RESERVE_GB,
+    DEFAULT_EXPANSION, DEFAULT_MEM_FRACTION,
 )
 from meg_qc.calculation.recording_progress import RecordingProgress, recording_id
 
@@ -150,6 +151,13 @@ _PROCESSED_SUBJECT_POLICIES = {"skip", "rerun", "stop"}
 
 
 _BIDS_ENTITY_RE = re.compile(r"([a-zA-Z]+)-([a-zA-Z0-9]+)")
+
+
+
+def _utc_timestamp() -> str:
+    """Now in UTC as ``YYYY-MM-DDTHH:MM:SSZ`` (the format the progress and
+    error records have always used; utcnow() is deprecated from Python 3.12)."""
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _raw_entities(raw_name) -> dict:
@@ -706,6 +714,34 @@ def get_files_list(sid: str, dataset_path: str, dataset, m_or_g_chosen: list = N
     return list_of_files, entities_per_file
 
 
+def _write_used_settings(config_file_path: str, file_path: str) -> None:
+    """The run's settings file, completed with the section (or keys) of every
+    installed plugin it lacks: the plugin then ran with those defaults, and
+    the copy should say so. Byte for byte when nothing is missing; otherwise in
+    the file's own encoding (configparser reads with the locale's, so a
+    Windows file saved as ANSI is not UTF-8)."""
+    import locale
+    from meg_qc.plugins.registry import with_plugin_sections
+    with open(config_file_path, "rb") as src:
+        data = src.read()
+    # latin-1 decodes any bytes and writes them back unchanged: the last resort.
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "latin-1"):
+        try:
+            text = data.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    else:
+        shutil.copy(config_file_path, file_path)
+        return
+    completed = with_plugin_sections(text)
+    if completed == text:
+        shutil.copy(config_file_path, file_path)
+        return
+    with open(file_path, "w", encoding=encoding, newline="") as dst:
+        dst.write(completed)
+
+
 def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: str, all_taken_raw_files: List[str]):
     """
     Save the config file used for this run as a derivative.
@@ -736,7 +772,7 @@ def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: s
     config_folder = root_folder.create_folder(name='config')
     config_artifact = config_folder.create_artifact()
 
-    config_artifact.content = lambda file_path, cont=config_file_path: shutil.copy(cont, file_path)
+    config_artifact.content = lambda file_path, cont=config_file_path: _write_used_settings(cont, file_path)
     config_artifact.add_entity('desc', f_name_to_save)  # file name
     config_artifact.suffix = 'settings'
     config_artifact.extension = '.ini'
@@ -1120,7 +1156,16 @@ def check_sub_list(sub_list: Union[List[str], str], dataset):
 
     """
 
-    available_subs = sorted(list(dataset.query_entities(scope='raw')['subject']))
+    try:
+        entities = dataset.query_entities(scope='raw') or {}
+    except TypeError:  # ancpbids gives None for an empty query on some platforms
+        entities = {}
+    available_subs = sorted(entities.get('subject', []))
+    if not available_subs:
+        # A dataset with no sub-* recordings used to stop the whole run with
+        # KeyError: 'subject'; the caller skips the dataset and moves on.
+        print('___MEGqc___: ', 'No subjects with recordings found in this data set.')
+        return None
     if sub_list == 'all':
         sub_list = available_subs
     elif isinstance(sub_list, str) and sub_list != 'all':
@@ -1191,7 +1236,7 @@ def _run_metric_safe(metric_name: str, func, *args, n_outputs: int, empty_output
             "error_type": type(exc).__qualname__,
             "error_message": str(exc),
             "traceback": tb_str,
-            "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "timestamp": _utc_timestamp(),
         }
         print(
             f"___MEGqc___: Metric '{metric_name}' FAILED — subject will continue "
@@ -1437,34 +1482,21 @@ def _compute_one_recording(file_ind, data_file, *, all_qc_params,
               % (time.time() - start_time))
 
     # 4) ECG
-    megnet_outputs_for_file = None
-    # MEGnet is an expensive extra step (ICA + inference per recording), so
-    # only run it when the ECG/EOG settings actually ask for it. Previously
-    # it ran whenever ECG or EOG was enabled, ignoring megnet_fallback,
-    # megnet_independent and megnet_optional_dependency entirely - which
-    # cost a full ICA per file even when the result was never consumed.
-    _ecg_p = all_qc_params.get('ECG', {})
-    _eog_p = all_qc_params.get('EOG', {})
-    _wants_megnet = bool(
-        (all_qc_params['default']['run_ECG'] is True
-         and (_ecg_p.get('megnet_fallback') or _ecg_p.get('megnet_independent')))
-        or (all_qc_params['default']['run_EOG'] is True
-            and (_eog_p.get('megnet_fallback') or _eog_p.get('megnet_independent')))
-    )
-    if not _wants_megnet:
-        print('___MEGqc___: MEGnet not requested by config '
-              '(megnet_fallback/megnet_independent are off) - skipping.')
-    if _wants_megnet:
-        try:
-            megnet_outputs_for_file = compute_megnet_outputs_for_file(
-                data_path=raw_cropped,
-                megnet_params=all_qc_params.get('MEGNET', {}),
-                raw=raw_cropped if hasattr(raw_cropped, 'info') else None,
-                derivatives_root=derivatives_root,
-            )
-        except Exception as _megnet_exc:
-            print(f'___MEGqc___: MEGnet pre-computation failed: {_megnet_exc}')
-            megnet_outputs_for_file = None
+    # Reference signals from plugins (e.g. MEGnet), computed once for both
+    # metrics and only when a plugin's settings ask for them. Each plugin
+    # decides whether it applies to this recording (MEGnet: MEG systems it was
+    # trained on, long enough recordings) and says why when it does not.
+    references = []
+    if all_qc_params['default']['run_ECG'] is True or all_qc_params['default']['run_EOG'] is True:
+        _work_root = derivatives_root or os.getcwd()
+        references = compute_references(
+            all_qc_params.get('PLUGINS', {}),
+            run_ecg=all_qc_params['default']['run_ECG'] is True,
+            run_eog=all_qc_params['default']['run_EOG'] is True,
+            work_root=_work_root,
+            load_recording=lambda: recording_as_recorded(
+                data_file, all_qc_params['default'], _work_root),
+        )
 
     if all_qc_params['default']['run_ECG'] is True:
         print('___MEGqc___: ', 'Starting ECG...')
@@ -1473,13 +1505,12 @@ def _compute_one_recording(file_ind, data_file, *, all_qc_params,
             'ECG',
             ECG_meg_qc,
             all_qc_params['ECG'],
-            all_qc_params.get('MEGNET', {}),
             internal_qc_params['ECG'],
             raw_cropped,
             channels,
             chs_by_lobe,
             m_or_g_chosen,
-            megnet_outputs=megnet_outputs_for_file,
+            references=references,
             n_outputs=4,
             empty_outputs=[[], [], '⚠ ECG metric failed — see excluded_subjects_errors.json for details.', []],
         )
@@ -1501,13 +1532,12 @@ def _compute_one_recording(file_ind, data_file, *, all_qc_params,
             'EOG',
             EOG_meg_qc,
             all_qc_params['EOG'],
-            all_qc_params.get('MEGNET', {}),
             internal_qc_params['EOG'],
             raw_cropped,
             channels,
             chs_by_lobe,
             m_or_g_chosen,
-            megnet_outputs=megnet_outputs_for_file,
+            references=references,
             n_outputs=4,
             empty_outputs=[[], [], '⚠ EOG metric failed — see excluded_subjects_errors.json for details.', []],
         )
@@ -1820,7 +1850,7 @@ def process_one_recording(
                     'error_message': (
                         f'{expected_file} is no longer listed for sub-{sub}'),
                     'traceback': '',
-                    'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                    'timestamp': _utc_timestamp(),
                 }],
             }
 
@@ -1854,7 +1884,7 @@ def process_one_recording(
             'error_type': type(exc).__qualname__,
             'error_message': str(exc),
             'traceback': _tb.format_exc(),
-            'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'timestamp': _utc_timestamp(),
         })
         # Recorded as failed, never as written: a later run must retry it.
         progress.record(data_file, 'failed', errors)
@@ -1888,7 +1918,7 @@ def process_one_recording_safe(**kwargs):
             'error_type': type(exc).__qualname__,
             'error_message': str(exc),
             'traceback': _tb.format_exc(),
-            'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            'timestamp': _utc_timestamp(),
         }
         try:
             msg = (f'___MEGqc___: Error processing {os.path.basename(str(expected))} '
@@ -2033,8 +2063,9 @@ def make_derivative_meg_qc(
         processed_subjects_policy: str = "skip",
         interactive_prompts: bool = False,
         keep_temp_on_error: bool = False,
+        memory_guard: bool = True,
         mem_fraction: float = DEFAULT_MEM_FRACTION,
-        mem_reserve_gb: float = DEFAULT_MEM_RESERVE_GB,
+        mem_reserve_gb: Optional[float] = None,
         assume_expansion: float = DEFAULT_EXPANSION,
         output_layout: str = "bids",
 ):
@@ -2043,11 +2074,11 @@ def make_derivative_meg_qc(
     Parameters
     ----------
     analysis_mode
-        ``legacy`` writes to ``derivatives/MEEGqc``.
-        ``new``/``reuse``/``latest`` write under
+        ``non-profile`` writes to ``derivatives/MEEGqc``.
+        ``new-profile``/``reuse-profile``/``latest-profile`` write under
         ``derivatives/MEEGqc/profiles/<analysis_id>``.
     analysis_id
-        Profile identifier used with ``new`` or ``reuse``.
+        Profile identifier used with ``new-profile`` or ``reuse-profile``.
     existing_config_policy
         Policy for choosing config when snapshots already exist in profile.
     processed_subjects_policy
@@ -2061,6 +2092,14 @@ def make_derivative_meg_qc(
         ``"bids"`` keeps the existing external layout
         ``<output>/<dataset>/derivatives/MEEGqc``. ``"literal"`` writes to
         ``<output>/MEEGqc`` and requires ``derivatives_base``.
+    memory_guard
+        ``False`` runs ``n_jobs`` recordings at once whatever the memory. When
+        ``True`` (default) the memory guard may lower ``n_jobs`` to what fits
+        in RAM (see ``meg_qc.calculation.resource_budget``).
+    mem_fraction, mem_reserve_gb, assume_expansion
+        How permissive the guard is: the share of available RAM a run may use,
+        the RAM always left free (``None``: the default level's reserve on this
+        machine) and the RAM per recording as a multiple of its file size.
     """
     start_time = time.time()
 
@@ -2184,12 +2223,15 @@ def make_derivative_meg_qc(
                 # than a per-subject stand-in. Only ever reduces, and says so.
                 _eff_jobs, _guard_note = effective_jobs(
                     n_jobs, [_f for _, _, _f in _work],
+                    enabled=memory_guard,
                     mem_fraction=mem_fraction, mem_reserve_gb=mem_reserve_gb,
                     expansion=assume_expansion)
                 if _guard_note:
                     print(f'___MEGqc___: {_guard_note}')
+                # joblib reads -1 as "every core"; say how many that is.
                 print('___MEGqc___: %d recording(s) over %d worker(s)'
-                      % (len(_work), _eff_jobs))
+                      % (len(_work),
+                         (os.cpu_count() or 1) if _eff_jobs < 0 else _eff_jobs))
 
                 # Processes, not threads: each concurrent recording keeps its
                 # memory in its own worker and gives it back on recycle.
@@ -2322,7 +2364,7 @@ def make_derivative_meg_qc(
                             "no raw files found, or all files were skipped."
                         )
                         entry["traceback"] = None
-                        entry["timestamp"] = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                        entry["timestamp"] = _utc_timestamp()
                     error_log.append(entry)
 
                 # --- Partial failures (metric-level) ---

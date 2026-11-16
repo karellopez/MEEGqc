@@ -26,6 +26,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from meg_qc.plotting.reference_sources import (
+    contribution_html,
+    describe_source,
+    format_plugin_references,
+    parse_plugin_references,
+    plugin_references_in,
+    remember_label,
+    source_key,
+    symbols_for,
+)
+from meg_qc.plotting.style_controls import (
+    attach_distribution_style_controls as _attach_distribution_style_controls,
+)
 from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
 from pandas.errors import DtypeWarning
@@ -148,12 +161,20 @@ class RunMetricRow:
     muscle_p95: float = np.nan
     # Where the ECG/EOG reference signal came from for this recording:
     # "recorded" (a real ECG/EOG channel), "mne_reconstructed" (rebuilt by MNE
-    # from the MEG channels) or "megnet" (a synthetic component picked by
-    # MEGnet). Written per recording by the calculation module; surfaced here so
+    # from the MEG channels) or a plugin's name such as "megnet" (a synthetic
+    # component picked by MEGnet). Written per recording by the calculation module; surfaced here so
     # dataset- and multi-dataset-level reports can show how much of their
     # physiological QC rests on synthetic signals.
     ecg_signal_source: str = "n/a"
     eog_signal_source: str = "n/a"
+    # A plugin's display name ("MEGnet"), read in the worker that loaded the
+    # recording, so the report can name the plugin even where it is not
+    # installed (labels learned inside a worker process stay there).
+    ecg_signal_source_label: str = ""
+    eog_signal_source_label: str = ""
+    # Plugins whose own reference was analysed for this recording (beside the
+    # recorded one or instead of it): "megnet:MEGnet".
+    plugin_references: str = ""
 
 
 @dataclass
@@ -2540,10 +2561,10 @@ def _plot_summary_distribution_recordings(
         )
     )
     # For ECG/EOG panels the value depends on which reference signal was used
-    # (a recorded channel, an MNE reconstruction, or a MEGnet synthetic
-    # component). Those are not directly comparable, so mark them with distinct
-    # symbols: a reader can then see at a glance whether the MEGnet-derived
-    # points sit in a different part of the distribution. Colour still encodes
+    # (a recorded channel, an MNE reconstruction, or a plugin's synthetic
+    # component such as MEGnet's). Those are not directly comparable, so mark
+    # them with distinct symbols: a reader can then see at a glance whether the
+    # synthetic points sit in a different part of the distribution. Colour still encodes
     # subject, as before, so nothing is lost.
     _prov_col = None
     if value_col.startswith("ecg_"):
@@ -2563,14 +2584,9 @@ def _plot_summary_distribution_recordings(
     }
     prov_labels = None
     if _prov_col is not None and _prov_col in data.columns:
-        sym_by_source = {
-            "recorded": "circle",
-            "mne_reconstructed": "diamond",
-            "megnet": "star",
-            "correlation_megnet": "star",
-        }
         prov_labels = data[_prov_col].astype(str).to_numpy()
-        symbols = [sym_by_source.get(s, "x-thin") for s in prov_labels]
+        sym_by_source = symbols_for(prov_labels)
+        symbols = [sym_by_source.get(source_key(s), "x-thin") for s in prov_labels]
         if len(set(symbols)) > 1 or symbols[:1] != ["circle"]:
             marker["symbol"] = symbols
 
@@ -2595,18 +2611,13 @@ def _plot_summary_distribution_recordings(
         )
     )
     if prov_labels is not None:
-        seen = [s for s in ("recorded", "mne_reconstructed", "megnet")
-                if s in set(prov_labels)]
-        if len(seen) > 1:
-            nice = {"recorded": "recorded channel",
-                    "mne_reconstructed": "MNE reconstruction",
-                    "megnet": "MEGnet synthetic"}
-            sym = {"recorded": "circle", "mne_reconstructed": "diamond", "megnet": "star"}
-            for s in seen:
+        sym = symbols_for(prov_labels)
+        if len(sym) > 1:
+            for s, symbol in sym.items():
                 fig.add_trace(go.Scatter(
                     x=[None], y=[None], mode="markers",
-                    marker={"size": 9, "symbol": sym[s], "color": "#555"},
-                    name=nice[s], showlegend=True))
+                    marker={"size": 9, "symbol": symbol, "color": "#555"},
+                    name=describe_source(s, short=True), showlegend=True))
             fig.update_layout(legend={"orientation": "h", "yanchor": "bottom",
                                       "y": 1.02, "x": 0, "font": {"size": 10}})
     fig.update_layout(
@@ -2700,6 +2711,7 @@ def _pooled_topomap_payload(
 
 
 _SIGNAL_SOURCE_CACHE: Dict[str, str] = {}
+_SIGNAL_SOURCE_LABELS: Dict[str, str] = {}
 
 
 def _read_signal_source(tsv_path) -> str:
@@ -2707,7 +2719,9 @@ def _read_signal_source(tsv_path) -> str:
 
     The calculation module writes ``signal_source`` on the first data row of
     ``desc-ECGchannel``/``desc-EOGchannel`` ("recorded", "mne_reconstructed" or
-    "megnet"). Only that first row carries it, so the whole file is not needed.
+    a plugin's name, e.g. "megnet", with its display name in
+    ``signal_source_label``). Only that first row carries it, so the whole file
+    is not needed.
     Returns "n/a" when the file is missing or does not carry the column, which
     is the case for outputs produced before provenance was recorded.
     """
@@ -2728,13 +2742,24 @@ def _read_signal_source(tsv_path) -> str:
                 if idx < len(first) and first[idx].strip():
                     value = first[idx].strip()
                     break
+        if "signal_source_label" in header:
+            idx = header.index("signal_source_label")
+            if idx < len(first) and first[idx].strip():
+                _SIGNAL_SOURCE_LABELS[key] = first[idx].strip()
+                remember_label(source_key(value), first[idx].strip())
     except Exception:
         value = "n/a"
     _SIGNAL_SOURCE_CACHE[key] = value
     return value
 
 
-def megnet_provenance_summary(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
+def _plugin_label(tsv_path) -> str:
+    """The display name a plugin's reference table records ("MEGnet")."""
+    _read_signal_source(tsv_path)          # reads (and caches) the name too
+    return _SIGNAL_SOURCE_LABELS.get(str(tsv_path), "")
+
+
+def reference_provenance_summary(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
     """Count recordings by ECG/EOG signal provenance.
 
     Returns ``{"ECG": {source: n_recordings}, "EOG": {...}}`` counting each
@@ -2753,17 +2778,11 @@ def megnet_provenance_summary(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
     return out
 
 
-def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
+def _reference_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
     """Render the ECG/EOG provenance breakdown as a small table."""
-    summary = megnet_provenance_summary(df)
+    summary = reference_provenance_summary(df)
     if not summary["ECG"] and not summary["EOG"]:
         return ""
-    nice = {
-        "recorded": "recorded channel",
-        "mne_reconstructed": "reconstructed by MNE",
-        "megnet": "MEGnet synthetic component",
-        "correlation_megnet": "MEGnet synthetic component",
-    }
     rows = []
     for label in ("ECG", "EOG"):
         counts = summary.get(label) or {}
@@ -2773,36 +2792,17 @@ def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
         parts = []
         for src, n in sorted(counts.items(), key=lambda kv: -kv[1]):
             pct = 100.0 * n / total if total else 0.0
-            parts.append(f"{nice.get(src, src)}: <strong>{n}</strong> ({pct:.0f}%)")
+            parts.append(f"{describe_source(src)}: <strong>{n}</strong> ({pct:.0f}%)")
         rows.append(f"<tr><td>{label}</td><td>{' &nbsp;·&nbsp; '.join(parts)}</td>"
                     f"<td>{total}</td></tr>")
     if not rows:
         return ""
 
-    # MEGnet availability line: how many recordings ended up using a MEGnet
-    # component. Without this a run where MEGnet failed on every recording
-    # looks identical in the report to one where it was never enabled.
+    # One line per reference plugin (e.g. MEGnet): how many recordings ended up
+    # using its signal. Without it, a run where the plugin failed on every
+    # recording looks identical in the report to one where it was never on.
     base = df.drop_duplicates(subset=["run_key"]) if "run_key" in df.columns else df
-    n_rec_total = int(base.shape[0])
-    megnet_used = 0
-    for col in ("ecg_signal_source", "eog_signal_source"):
-        if col in base.columns:
-            megnet_used = max(
-                megnet_used,
-                int(base[col].astype(str).isin(["megnet", "correlation_megnet"]).sum()),
-            )
-    if n_rec_total:
-        pct = 100.0 * megnet_used / n_rec_total
-        avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
-                 f"<strong>{megnet_used}</strong> of {n_rec_total} recordings ({pct:.0f}%). "
-                 + ("MEGnet produced nothing usable here - either it was disabled, its model "
-                    "weights are missing (run <code>megnet_init</code>), the recordings are "
-                    "shorter than 60 s, or the system has no magnetometers."
-                    if megnet_used == 0 else
-                    "Recordings without it fell back to a recorded channel or an MNE "
-                    "reconstruction.") + "</p>")
-    else:
-        avail = ""
+    avail = contribution_html(base, ("ecg_signal_source", "eog_signal_source"))
 
     return (
         "<section><h2>ECG/EOG signal provenance" + (f" - {scope_label}" if scope_label else "") + "</h2>"
@@ -2812,8 +2812,8 @@ def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
         "<tbody>" + "".join(rows) + "</tbody></table>"
         "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG quality "
         "metrics are computed against a reference signal. That signal is ideally a recorded "
-        "channel; when none exists MEEGqc reconstructs one from the MEG sensors, and MEGnet can "
-        "supply a synthetic component instead. Values derived from reconstructed or synthetic "
+        "channel; when none exists MEEGqc reconstructs one from the MEG sensors, and a plugin "
+        "such as MEGnet can supply a synthetic component instead. Values derived from reconstructed or synthetic "
         "references are not directly comparable with values from a recorded channel, so a dataset "
         "dominated by one provenance should be interpreted accordingly.</p></section>"
     )
@@ -2822,6 +2822,11 @@ def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
 def _run_rows_dataframe(rows: List[RunMetricRow]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
+    for row in rows:  # plugin display names read in the workers
+        remember_label(source_key(row.ecg_signal_source), row.ecg_signal_source_label)
+        remember_label(source_key(row.eog_signal_source), row.eog_signal_source_label)
+        for source, label in parse_plugin_references(row.plugin_references).items():
+            remember_label(source, label)
     df = pd.DataFrame([row.__dict__ for row in rows])
     numeric_cols = [
         "std_mean", "std_median", "std_upper_tail", "std_median_norm", "std_upper_tail_norm",
@@ -3304,111 +3309,6 @@ def _hex_to_rgba(color: str, alpha: float) -> str:
         b = int(c[5:7], 16)
         return f"rgba({r},{g},{b},{float(alpha):.3f})"
     return c
-
-
-def _attach_distribution_style_controls(
-    fig: go.Figure,
-    *,
-    default_line_width: float = 2.2,
-    default_marker_size: float = 8.0,
-) -> None:
-    """Attach numeric style controls for distribution plots."""
-    if fig is None or not fig.data:
-        return
-
-    marker_level_to_size = {1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}
-
-    has_marker_traces = False
-    for tr in fig.data:
-        t = getattr(tr, "type", "")
-        mode = str(getattr(tr, "mode", "") or "")
-        if t in {"scatter", "scattergl"} and ("markers" in mode):
-            has_marker_traces = True
-            break
-
-    def _line_restyle(level: int) -> Dict[str, List[Optional[float]]]:
-        line_width: List[Optional[float]] = []
-        marker_line_width: List[Optional[float]] = []
-        lw = float(level)
-        for tr in fig.data:
-            t = getattr(tr, "type", "")
-            mode = str(getattr(tr, "mode", "") or "")
-            if t in {"scatter", "scattergl", "violin", "box"}:
-                line_width.append(lw)
-            else:
-                line_width.append(None)
-            if t == "histogram":
-                marker_line_width.append(max(0.5, lw * 0.6))
-            elif t in {"scatter", "scattergl"} and ("markers" in mode):
-                marker_line_width.append(max(0.25, lw * 0.2))
-            else:
-                marker_line_width.append(None)
-        return {
-            "line.width": line_width,
-            "marker.line.width": marker_line_width,
-        }
-
-    def _marker_restyle(level: int) -> Dict[str, List[Optional[float]]]:
-        marker_size: List[Optional[float]] = []
-        size = float(marker_level_to_size.get(level, default_marker_size))
-        for tr in fig.data:
-            t = getattr(tr, "type", "")
-            mode = str(getattr(tr, "mode", "") or "")
-            if t in {"scatter", "scattergl"} and ("markers" in mode):
-                marker_size.append(size)
-            else:
-                marker_size.append(None)
-        return {"marker.size": marker_size}
-
-    levels = list(range(1, 9))
-    line_active = int(np.clip(int(round(default_line_width)), 1, 8) - 1)
-    marker_active_guess = min(levels, key=lambda lv: abs(marker_level_to_size[lv] - float(default_marker_size)))
-    marker_active = int(marker_active_guess - 1)
-
-    line_buttons = [
-        dict(
-            label=str(level),
-            method="restyle",
-            args=[_line_restyle(level)],
-        )
-        for level in levels
-    ]
-    marker_buttons = []
-    if has_marker_traces:
-        marker_buttons = [
-            dict(
-                label=str(level),
-                method="restyle",
-                args=[_marker_restyle(level)],
-            )
-            for level in levels
-        ]
-
-    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
-    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
-    if "Line thickness level" not in menu_names:
-        existing.append(
-            dict(
-                name="Line thickness level",
-                type="buttons",
-                direction="right",
-                showactive=True,
-                active=line_active,
-                buttons=line_buttons,
-            )
-        )
-    if marker_buttons and ("Dot size level" not in menu_names):
-        existing.append(
-            dict(
-                name="Dot size level",
-                type="buttons",
-                direction="right",
-                showactive=True,
-                active=marker_active,
-                buttons=marker_buttons,
-            )
-        )
-    fig.update_layout(updatemenus=existing)
 
 
 def _attach_dot_alignment_controller(
@@ -6456,11 +6356,12 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
     ]
 
     # ECG/EOG provenance for this dataset: how many recordings used a real
-    # channel, an MNE reconstruction, or a MEGnet synthetic component. The
-    # calculation module records this per recording; without surfacing it here
-    # MEGnet's contribution is invisible above the single-recording report.
+    # channel, an MNE reconstruction, or a plugin's synthetic component (e.g.
+    # MEGnet's). The calculation module records this per recording; without
+    # surfacing it here a plugin's contribution is invisible above the
+    # single-recording report.
     try:
-        _prov_html = _megnet_provenance_html(_run_rows_dataframe(acc.run_rows))
+        _prov_html = _reference_provenance_html(_run_rows_dataframe(acc.run_rows))
     except Exception:
         _prov_html = ""
     if _prov_html:
@@ -7510,6 +7411,10 @@ def _update_accumulator_for_loaded_run(
             channel_type=ch_type,
             ecg_signal_source=_read_signal_source(files.get("ECGchannel")),
             eog_signal_source=_read_signal_source(files.get("EOGchannel")),
+            ecg_signal_source_label=_SIGNAL_SOURCE_LABELS.get(str(files.get("ECGchannel")), ""),
+            eog_signal_source_label=_SIGNAL_SOURCE_LABELS.get(str(files.get("EOGchannel")), ""),
+            plugin_references=format_plugin_references(plugin_references_in(
+                files, lambda desc: _plugin_label(files[desc]))),
         )
 
         if ch_type in std_data:
@@ -8190,10 +8095,10 @@ def make_dataset_plots_meg_qc(
         Number of parallel workers for subject-level run processing. Use ``1``
         for sequential mode, or ``-1`` to use all available cores.
     analysis_mode : str
-        Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
-        Plotting typically uses ``legacy`` or ``reuse``/``latest``.
+        Analysis root selection mode (``non-profile``, ``new-profile``, ``reuse-profile``, ``latest-profile``).
+        Plotting typically uses ``non-profile`` or ``reuse-profile``/``latest-profile``.
     analysis_id : str, optional
-        Profile ID used with ``analysis_mode='reuse'``.
+        Profile ID used with ``analysis_mode='reuse-profile'``.
     output_layout : str
         ``"bids"`` preserves the existing external tree. ``"literal"`` uses
         ``derivatives_base`` as the folder containing ``MEEGqc``.

@@ -137,7 +137,7 @@ class RecordingProgress:
             "recording": recording_id(recording),
             "status": status,
             "errors": list(errors or []),
-            "t": _dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "t": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         line = json.dumps(entry) + "\n"
         with self._lock:

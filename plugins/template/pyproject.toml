@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# Copy this folder, then rename everything that says "example".
+[project]
+name = "meegqc-example"
+version = "0.1.0"
+description = "A MEEGqc plugin template"
+requires-python = ">=3.10"
+dependencies = [
+    "meg_qc>=1.1.2",   # the first MEEGqc release with the plugin API
+]
+
+[project.entry-points."meegqc.plugins"]
+example = "meegqc_example:plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+meegqc_example = ["settings.ini"]

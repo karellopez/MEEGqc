@@ -16,14 +16,39 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
+#: The GUI preferences of this test session (see settings_store.py). Set before
+#: any test runs, so no test ever reads or writes the user's own preferences
+#: (macOS plist, Windows registry, ~/.config on Linux).
+_SETTINGS_DIR = None
+#: True when the folder is outside pytest's temp folder and must be removed here.
+_SETTINGS_DIR_IS_OURS = False
 
+
+@pytest.hookimpl(trylast=True)  # after pytest has set up its temp folder
 def pytest_configure(config):
+    global _SETTINGS_DIR, _SETTINGS_DIR_IS_OURS
     config.addinivalue_line("markers", "realdata: needs the MEEGQC_TEST_DATA bundle")
     config.addinivalue_line("markers", "gui: headless Qt GUI test (offscreen)")
+    factory = getattr(config, "_tmp_path_factory", None)
+    if factory is not None:
+        # Inside pytest's own temp folder, so a run that is killed leaves no
+        # folder behind in the system's temp (the next run clears --basetemp,
+        # and pytest rotates its default ones).
+        _SETTINGS_DIR = str(factory.mktemp("gui_settings", numbered=False))
+    else:
+        _SETTINGS_DIR = tempfile.mkdtemp(prefix="meegqc_test_settings_")
+        _SETTINGS_DIR_IS_OURS = True
+    os.environ["MEEGQC_SETTINGS_DIR"] = _SETTINGS_DIR
+
+
+def pytest_unconfigure(config):
+    if _SETTINGS_DIR and _SETTINGS_DIR_IS_OURS:
+        shutil.rmtree(_SETTINGS_DIR, ignore_errors=True)
 
 
 def pytest_generate_tests(metafunc):
@@ -144,7 +169,7 @@ def one_meg():
 
 @pytest.fixture(scope="session")
 def megnet_meg_dataset():
-    """MEGnet tests require ds_meg_example_1_complete (long enough for 60 s chunks)."""
+    """MEGnet tests require ds_meg_example_1_complete (longer than MEGnet's 105 s)."""
     for name, path in ALL_DATASETS:
         if name == "ds_meg_example_1_complete":
             return (name, path)
@@ -192,12 +217,32 @@ def named_dataset():
     return _get
 
 
+#: Files at least this large are hard-linked into a test's dataset copy, not
+#: copied: they are recordings, which MEEGqc only reads. Smaller files
+#: (sidecars, tables) are copied, so nothing a run writes can reach the bundle.
+_LINK_FROM_BYTES = 1 << 20
+
+
+def _link_or_copy(src: str, dst: str) -> str:
+    if os.path.getsize(src) >= _LINK_FROM_BYTES:
+        try:
+            os.link(src, dst)
+            return dst
+        except OSError:  # another drive, or a filesystem without hard links
+            pass
+    return shutil.copy2(src, dst)
+
+
 @pytest.fixture
 def isolated_dataset(tmp_path):
-    """Copy a fixture dataset into tmp_path so the run writes derivatives there."""
+    """A fixture dataset in tmp_path, so the run writes its derivatives there.
+
+    Recordings are hard-linked rather than copied: every real-data test made
+    its own copy (one test copies a 736 MB dataset), several GB per Python.
+    """
     def _copy(ds_path: Path) -> Path:
         dst = tmp_path / Path(ds_path).name
-        shutil.copytree(ds_path, dst)
+        shutil.copytree(ds_path, dst, copy_function=_link_or_copy)
         return dst
     return _copy
 
@@ -218,7 +263,8 @@ def run_cli(args, timeout=1800):
 
 @pytest.fixture(scope="session")
 def _megnet_config_factory(tmp_path_factory):
-    """settings.ini with ECG + EOG + MEGnet enabled, rest minimal for speed."""
+    """settings.ini with ECG + EOG on, rest minimal for speed. MEGnet (when its
+    plugin is installed) runs with its defaults: both references independent."""
     import re as _re
 
     ini_src = _package_settings_ini()

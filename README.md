@@ -131,8 +131,27 @@ Both naming families work, you can mix and match. Every `meeg*` command is an al
 | `run-meegqc-plotting` | `run-megqc-plotting`       | HTML report builder                                      |
 | `get-meegqc-config`   | `get-megqc-config`         | Write the default `settings.ini` to a target directory   |
 | `globalqualityindex`  | (no alias)                 | Recompute the GQI summaries on existing derivatives      |
+| `meegqc-plugins`      | (no alias)                 | List, install and remove plugins                         |
 
 Note the two flag spellings: `run-megqc` uses `--n_jobs` (with underscore); `run-megqc-plotting` uses `--njobs` (no underscore). They are not interchangeable.
+
+## Plugins
+
+Plugins add optional features without enlarging MEEGqc's own install. Install
+and remove them from the GUI (**Plugins**) or with `meegqc-plugins`:
+
+```bash
+meegqc-plugins list              # installed plugins and the ones MEEGqc can install
+meegqc-plugins install megnet    # MEGnet: ECG/EOG references for MEG recordings
+meegqc-plugins remove megnet
+```
+
+| Plugin | What it adds |
+|---|---|
+| `megnet` | MEGnet's heartbeat and eye-movement components as ECG/EOG references, for MEG recordings without a usable ECG or EOG channel (MEGIN, CTF, 4D, KIT; at least 105 s). Brings PyTorch and Keras. |
+
+A plugin's settings are a section of `settings.ini` (MEGnet's is `[MEGNET]`). To
+write a plugin, see [`plugins/README.md`](https://github.com/ANCPLabOldenburg/MEEGqc/blob/main/plugins/README.md).
 
 ## Typical outputs
 

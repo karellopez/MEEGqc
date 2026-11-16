@@ -4,7 +4,38 @@ import shutil
 import sys
 import time
 import datetime as dt
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+
+from meg_qc.calculation.resource_budget import (
+    DEFAULT_EXPANSION, DEFAULT_GUARD_LEVEL, DEFAULT_MEM_FRACTION, GUARD_LEVELS,
+    level_values,
+)
+
+
+def _memory_guard_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """The memory-guard keyword arguments of the dispatchers, from the CLI.
+
+    ``--memory-guard LEVEL`` sets all three numbers for this machine; any of
+    ``--mem-fraction``, ``--mem-reserve-gb`` or ``--assume-expansion`` given
+    explicitly overrides its value. ``off`` switches the guard off.
+    """
+    level = getattr(args, "memory_guard", DEFAULT_GUARD_LEVEL)
+    enabled = level != "off"
+    fraction, reserve, expansion = level_values(
+        level if enabled else DEFAULT_GUARD_LEVEL)
+    given = {
+        "mem_fraction": getattr(args, "mem_fraction", None),
+        "mem_reserve_gb": getattr(args, "mem_reserve_gb", None),
+        "assume_expansion": getattr(args, "assume_expansion", None),
+    }
+    return {
+        "memory_guard": enabled,
+        "mem_fraction": fraction if given["mem_fraction"] is None else given["mem_fraction"],
+        "mem_reserve_gb": reserve if given["mem_reserve_gb"] is None else given["mem_reserve_gb"],
+        "assume_expansion": (expansion if given["assume_expansion"] is None
+                             else given["assume_expansion"]),
+    }
 
 from meg_qc.output_paths import (
     dataset_derivatives_output,
@@ -209,17 +240,21 @@ def run_calculation_dispatch(
     processed_subjects_policy: str = "skip",
     interactive_prompts: bool = False,
     keep_temp_on_error: bool = False,
-    mem_fraction: float = 0.5,
-    mem_reserve_gb: float = 32.0,
-    assume_expansion: float = 4.0,
+    memory_guard: bool = True,
+    mem_fraction: float = DEFAULT_MEM_FRACTION,
+    mem_reserve_gb: Optional[float] = None,
+    assume_expansion: float = DEFAULT_EXPANSION,
     logger: Callable[[str], None] = print,
     output_layout: str = "bids",
 ) -> None:
     """
     Shared MEGqc calculation dispatcher used by CLI and GUI.
 
-    Runs one or multiple datasets sequentially. Subject-level parallelism remains
-    controlled by ``n_jobs`` (or ``dataset_njobs`` overrides when provided).
+    Runs one or multiple datasets sequentially. Within a dataset, ``n_jobs``
+    recordings run at once (or ``dataset_njobs`` overrides when provided),
+    lowered by the memory guard when they would not fit in RAM unless
+    ``memory_guard`` is False. ``mem_reserve_gb=None`` means the default
+    level's reserve on this machine.
     """
     from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
 
@@ -275,6 +310,7 @@ def run_calculation_dispatch(
             analysis_id=calc_analysis_id,
             existing_config_policy=existing_config_policy,
             processed_subjects_policy=processed_subjects_policy,
+            memory_guard=memory_guard,
             mem_fraction=mem_fraction,
             mem_reserve_gb=mem_reserve_gb,
             assume_expansion=assume_expansion,
@@ -376,6 +412,19 @@ def validate_plot_request(
             raise ValueError(
                 "--output_report with --qc-dataset is only supported for a single dataset."
             )
+
+
+def _has_calculation_results(megqc_root: str) -> bool:
+    """True when the calculation wrote at least one file for this analysis."""
+    calc = Path(megqc_root) / "calculation"
+    return calc.is_dir() and any(p.is_file() for p in calc.rglob("*"))
+
+
+def _why_nothing_was_calculated(megqc_root: str) -> str:
+    errors = Path(megqc_root) / "excluded_subjects_errors.json"
+    if errors.is_file():
+        return f"no recording could be calculated; why each one failed: {errors}"
+    return "it has no calculated results."
 
 
 def run_plotting_dispatch(
@@ -497,6 +546,7 @@ def run_plotting_dispatch(
     if not any([qa_subject, qa_dataset, qa_multi_dataset, qc_dataset, qc_multi_dataset, qa_all, qc_all, all_modes]):
         logger("No QA/QC plotting mode selected; defaulting to --qa-subject.")
 
+    calculated = []
     for ds in ds_list:
         _, derivatives_root, megqc_root, resolved_analysis_id, _segments = resolve_analysis_root(
             dataset_path=ds,
@@ -511,6 +561,24 @@ def run_plotting_dispatch(
             f"{derivatives_root} (analysis_root={megqc_root}, "
             f"analysis_id={resolved_analysis_id or 'legacy'})"
         )
+        if _has_calculation_results(megqc_root):
+            calculated.append(ds)
+        else:
+            logger(f"No reports for {ds}: {_why_nothing_was_calculated(megqc_root)}")
+
+    # A dataset whose every recording failed (or that was never calculated)
+    # has nothing to plot. Reports used to stop the whole run there with a
+    # FileNotFoundError traceback, which is also what Run ALL showed.
+    if not calculated:
+        logger("Nothing to plot: no dataset has calculated results.")
+        return {}
+    if len(calculated) < len(ds_list):
+        ds_list = calculated
+        if len(ds_list) < 2 and (modes["qa_multi_dataset"] or modes["qc_multi_dataset"]):
+            logger("Skipping the multi-dataset reports: fewer than two datasets "
+                   "have calculated results.")
+            modes["qa_multi_dataset"] = False
+            modes["qc_multi_dataset"] = False
 
     if modes["qa_subject"]:
         for ds in ds_list:
@@ -686,13 +754,8 @@ def run_megqc():
         help=(
             "Number of recordings processed in parallel.\n"
             "Default is 1. Use -1 to utilize all available CPU cores.\n"
-            "\n"
-            "⚠️ Recommendation based on system memory:\n"
-            "  - 8 GB RAM → up to 1 parallel job\n"
-            "  - 16 GB RAM → up to 2 parallel jobs\n"
-            "  - 32 GB RAM → up to 6 parallel jobs\n"
-            "  - 64 GB RAM → up to 16 parallel jobs\n"
-            "  - 128 GB RAM → up to 30 parallel jobs"
+            "The memory guard (--memory-guard) may run fewer at once when\n"
+            "they would not fit in RAM; the log says how many it allowed."
         ),
     )
 
@@ -750,28 +813,45 @@ def run_megqc():
         ),
     )
     dataset_path_parser.add_argument(
+        "--memory-guard",
+        choices=["off", *GUARD_LEVELS],
+        default=DEFAULT_GUARD_LEVEL,
+        metavar="LEVEL",
+        help=(
+            "How strictly to limit parallel recordings to what fits in RAM: "
+            "off, " + ", ".join(GUARD_LEVELS) + f" (default {DEFAULT_GUARD_LEVEL}). "
+            "Each level sets the three numbers below; any of them given "
+            "explicitly overrides the level. 'off' runs --n_jobs recordings "
+            "at once whatever the memory."
+        ),
+    )
+    dataset_path_parser.add_argument(
         "--mem-fraction",
         type=float,
-        default=0.5,
+        default=None,
         help=(
-            "Share of currently available RAM this run may use (default 0.5). "
-            "The memory guard is always on; this only tunes it."
+            "Share of currently available RAM this run may use, 0-1 "
+            "(balanced: 0.5)."
         ),
     )
     dataset_path_parser.add_argument(
         "--mem-reserve-gb",
         type=float,
-        default=32.0,
-        help="RAM headroom never claimed, in GB (default 32).",
+        default=None,
+        help=(
+            "RAM always left free, in GB (balanced: 12.5%% of total RAM, at "
+            "most 32)."
+        ),
     )
     dataset_path_parser.add_argument(
         "--assume-expansion",
         type=float,
-        default=4.0,
+        default=None,
         help=(
-            "Assumed RAM per recording divided by its on-disk size (default 4.0, "
-            "measured on MEG FIF: int32 becomes float64 plus filtered copies). "
-            "Raise it if the guard is letting runs grow too large for your data."
+            "Assumed RAM per recording divided by its on-disk size (balanced: "
+            "4.0, measured on MEG FIF: int32 becomes float64 plus filtered "
+            "copies). Raise it if the guard is letting runs grow too large "
+            "for your data."
         ),
     )
     dataset_path_parser.add_argument(
@@ -873,9 +953,7 @@ def run_megqc():
             analysis_id=args.analysis_id,
             existing_config_policy=args.existing_config_policy,
             processed_subjects_policy=args.processed_subjects_policy,
-            mem_fraction=getattr(args, 'mem_fraction', 0.5),
-            mem_reserve_gb=getattr(args, 'mem_reserve_gb', 32.0),
-            assume_expansion=getattr(args, 'assume_expansion', 4.0),
+            **_memory_guard_kwargs(args),
             interactive_prompts=False,
             keep_temp_on_error=args.keep_temp_on_error,
             qa_subject=args.qa_subject,
@@ -906,15 +984,13 @@ def run_megqc():
         analysis_id=args.analysis_id,
         existing_config_policy=args.existing_config_policy,
         processed_subjects_policy=args.processed_subjects_policy,
-        mem_fraction=getattr(args, 'mem_fraction', 0.5),
-        mem_reserve_gb=getattr(args, 'mem_reserve_gb', 32.0),
-        assume_expansion=getattr(args, 'assume_expansion', 4.0),
+        **_memory_guard_kwargs(args),
         interactive_prompts=False,
         keep_temp_on_error=args.keep_temp_on_error,
         logger=print,
     )
 
-    from meg_qc.output_paths import resolve_output_roots
+    from meg_qc.output_paths import output_roots
 
     dataset_paths = _normalize_dataset_paths(args.inputdata)
     for dataset_path in dataset_paths:
@@ -924,15 +1000,13 @@ def run_megqc():
             args.output_layout,
             multiple_datasets=len(dataset_paths) > 1,
         )
-        _, derivatives_root = resolve_output_roots(
+        # Only computed: saying where the results are must not create folders.
+        _, derivatives_root = output_roots(
             dataset_path,
             dataset_output,
             output_layout=args.output_layout,
         )
-        print(
-            "Results are available under: "
-            f"{os.path.join(derivatives_root, 'MEEGqc', 'calculation')}"
-        )
+        print(f"Results are available under: {os.path.join(derivatives_root, 'MEEGqc')}")
 
 
 def get_config():
@@ -970,8 +1044,15 @@ def get_config():
     config_file_path = os.path.join(path_to_megqc_installation, "settings", "settings.ini")
     print("Source of default config file:", config_file_path)
 
-    shutil.copy(config_file_path, destination_directory)
+    from meg_qc.plugins.registry import plugins, with_plugin_sections
+    with open(config_file_path, "r", encoding="utf-8") as src:
+        text = with_plugin_sections(src.read())
+    with open(destination_directory, "w", encoding="utf-8") as dst:
+        dst.write(text)
     print("The config file has been copied to " + destination_directory)
+    sections = [f"[{p.settings_section}] ({p.label})" for p in plugins() if p.settings_section]
+    if sections:
+        print("Including the settings of installed plugins: " + ", ".join(sections))
 
 
 def get_plots():
@@ -1267,6 +1348,10 @@ def run_all_dispatch(
     qa_all: bool = False,
     qc_all: bool = False,
     all_modes: bool = True,
+    memory_guard: bool = True,
+    mem_fraction: float = DEFAULT_MEM_FRACTION,
+    mem_reserve_gb: Optional[float] = None,
+    assume_expansion: float = DEFAULT_EXPANSION,
     logger: Callable[[str], None] = print,
     output_layout: str = "bids",
 ) -> None:
@@ -1301,6 +1386,10 @@ def run_all_dispatch(
         processed_subjects_policy=processed_subjects_policy,
         interactive_prompts=interactive_prompts,
         keep_temp_on_error=keep_temp_on_error,
+        memory_guard=memory_guard,
+        mem_fraction=mem_fraction,
+        mem_reserve_gb=mem_reserve_gb,
+        assume_expansion=assume_expansion,
         logger=logger,
     )
     run_plotting_dispatch(

@@ -2,308 +2,15 @@ import mne
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import os
-import hashlib
-import json
 from scipy.signal import find_peaks
 #import matplotlib #this is in case we will need to suppress mne matplotlib plots
 import copy
 from scipy.ndimage import gaussian_filter
 from scipy.stats import pearsonr
-from typing import List, Union, Dict
+from typing import List, Union, Sequence
 from meg_qc.plotting.universal_html_report import simple_metric_basic
 from meg_qc.plotting.universal_plots import QC_derivative, get_tit_and_unit
 from meg_qc.calculation.initial_meg_qc import (chs_dict_to_csv,load_data)
-
-def _resample_1d_to_length(signal: np.ndarray, target_len: int) -> np.ndarray:
-    """Resample a 1D signal to target length with linear interpolation."""
-    arr = np.asarray(signal, dtype=float).reshape(-1)
-    if arr.size == 0 or target_len <= 0:
-        return np.zeros(max(target_len, 0), dtype=float)
-    if arr.size == target_len:
-        return arr
-    x_old = np.linspace(0.0, 1.0, arr.size)
-    x_new = np.linspace(0.0, 1.0, target_len)
-    return np.interp(x_new, x_old, arr)
-
-
-def _pick_megnet_components(classes: np.ndarray, probs: np.ndarray, class_id: int, megnet_params: dict) -> tuple:
-    """Pick MEGnet component indices for one class based on threshold/combining settings."""
-    idx = np.where(classes == class_id)[0]
-    if idx.size == 0:
-        return np.array([], dtype=int), np.array([], dtype=float)
-
-    cls_probs = probs[idx, class_id]
-    order = np.argsort(cls_probs)[::-1]
-    idx = idx[order]
-    cls_probs = cls_probs[order]
-
-    thr = float(megnet_params.get('probability_threshold', 0.0))
-    keep = cls_probs >= thr
-    if not np.any(keep):
-        keep = np.zeros_like(cls_probs, dtype=bool)
-        keep[0] = True
-
-    idx = idx[keep]
-    cls_probs = cls_probs[keep]
-
-    combine = bool(megnet_params.get('combine_components', False))
-    max_comp = int(megnet_params.get('max_components_per_class', 2))
-    if not combine:
-        idx = idx[:1]
-        cls_probs = cls_probs[:1]
-    else:
-        idx = idx[:max(1, max_comp)]
-        cls_probs = cls_probs[:max(1, max_comp)]
-
-    return idx, cls_probs
-
-
-def _compose_megnet_signal(ica_ts: np.ndarray, comp_idx: np.ndarray, comp_probs: np.ndarray) -> np.ndarray:
-    """Compose a synthetic reference from one or more ICA components."""
-    if comp_idx.size == 0:
-        return np.array([])
-    selected = ica_ts[comp_idx]
-    if selected.ndim == 1:
-        return selected
-    if selected.shape[0] == 1:
-        return selected[0]
-    w = np.asarray(comp_probs, dtype=float)
-    if w.size != selected.shape[0] or np.sum(w) == 0:
-        w = np.ones(selected.shape[0], dtype=float)
-    w = w / np.sum(w)
-    return np.sum(selected * w[:, None], axis=0)
-
-
-_MEGNET_NOTCH_PATCHED = False
-_MEGNET_CPU_SET = False
-
-
-def _patch_megnet_notch_filter() -> None:
-    """Work around an upstream MEGnet bug for 50 Hz mains data.
-
-    ``MEGnet.prep_inputs.ICA.raw_preprocess`` builds its notch frequencies as
-    ``np.arange(mains_freq, 250 * 2/3, mains_freq)`` and applies them *before*
-    resampling. For 50 Hz mains that yields 50/100/150 Hz, and 150 Hz is above
-    the Nyquist frequency of any recording sampled at 300 Hz or less, so MNE
-    raises and MEGnet is lost for that file. It happens to be safe for 60 Hz
-    mains (60/120 Hz), which is presumably why it went unnoticed upstream.
-
-    The patch drops notch frequencies at or above the current Nyquist instead
-    of failing; everything else in raw_preprocess is untouched.
-    """
-    global _MEGNET_NOTCH_PATCHED
-    if _MEGNET_NOTCH_PATCHED:
-        return
-    try:
-        from MEGnet.prep_inputs import ICA as _megnet_ica
-    except Exception:
-        return
-    original = getattr(_megnet_ica, 'raw_preprocess', None)
-    if original is None or getattr(original, '_megqc_patched', False):
-        _MEGNET_NOTCH_PATCHED = True
-        return
-
-    def raw_preprocess(raw, mains_freq=None):
-        resample_freq = 250
-        mains = int(mains_freq) if mains_freq else 50
-        notch = np.arange(mains, resample_freq * 2 / 3, mains)
-        nyquist = float(raw.info['sfreq']) / 2.0
-        safe = notch[notch < nyquist]
-        if safe.size < notch.size:
-            print(f'___MEGqc___: MEGnet notch {list(notch)} Hz exceeds Nyquist '
-                  f'{nyquist:.1f} Hz at {raw.info["sfreq"]:.0f} Hz; using {list(safe)} Hz.')
-        if safe.size:
-            raw.notch_filter(safe)
-        raw.resample(resample_freq)
-        raw.filter(1.0, 100)
-        return raw
-
-    raw_preprocess._megqc_patched = True
-    _megnet_ica.raw_preprocess = raw_preprocess
-    _MEGNET_NOTCH_PATCHED = True
-
-
-def _prefer_cpu_for_megnet() -> None:
-    """Run MEGnet inference on CPU unless the user explicitly asks for GPU.
-
-    MEEGqc is routinely run with many datasets in parallel, and each worker that
-    touches the GPU reserves memory for a model of only ~29 MB. In a 28-way run
-    that produced 44 `CUDA error: out of memory` failures. CPU inference on this
-    model is cheap and removes the contention entirely. Set
-    ``MEGQC_MEGNET_GPU=1`` to keep the GPU.
-    """
-    global _MEGNET_CPU_SET
-    if _MEGNET_CPU_SET:
-        return
-    if os.environ.get('MEGQC_MEGNET_GPU', '').strip() not in ('', '0', 'false', 'False'):
-        _MEGNET_CPU_SET = True
-        return
-    os.environ.setdefault('KERAS_BACKEND', 'torch')
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    _MEGNET_CPU_SET = True
-
-
-def compute_megnet_outputs_for_file(
-    data_path,
-    megnet_params: dict,
-    raw: Union[mne.io.Raw, None] = None,
-    derivatives_root: Union[str, None] = None,
-) -> dict:
-    """Run MEGnet once for one file and return ECG/EOG synthetic candidates."""
-    if raw is None:
-        raw, _, _, _ = load_data(data_path)
-
-    result = {
-        'status': 'unavailable',
-        'reason': 'not-computed',
-        'ecg': None,
-        'eog': None,
-    }
-
-    try:
-        from scipy.io import loadmat
-        from MEGnet.prep_inputs.ICA import main as run_ica_pipeline
-        from meg_qc.miscellaneous.easy_megnet.easy_megnet import (
-            _classify_ica_with_probabilities,
-        )
-    except Exception as exc:
-        reason = (
-            "MEGnet import failed from installed package "
-            "(expected dependency: megnet-neuro): "
-            f"{exc}"
-        )
-        print(f'___MEGqc___: {reason}')
-        result['reason'] = reason
-        return result
-
-    # MEGnet needs at least one 60 s window at 250 Hz (15000 samples) to form a
-    # single classification chunk; below that its voting step stacks an empty
-    # list and raises. Recordings shorter than that - or cropped with
-    # data_crop_tmax - can never work, so say so instead of failing per file.
-    try:
-        _dur = float(raw.times[-1]) if raw is not None and len(raw.times) else 0.0
-    except Exception:
-        _dur = 0.0
-    if _dur < 60.0:
-        reason = (f'recording is {_dur:.1f} s; MEGnet needs >= 60 s '
-                  f'(15000 samples at 250 Hz) to form one chunk')
-        print(f'___MEGqc___: MEGnet skipped - {reason}')
-        result['status'] = 'skipped'
-        result['reason'] = reason
-        return result
-
-    # MEGnet ships without model weights: `pip install megnet-neuro` does not
-    # include them, they come from HuggingFace via `megnet_init`. The download
-    # lives inside _classify_ica_with_probabilities(), which runs *after*
-    # run_ica_pipeline() below - and that call raises first when the weights are
-    # absent, so the self-heal never fires. Fetch them up front instead.
-    try:
-        import MEGnet
-        from MEGnet.megnet_init import main as _megnet_init
-        _model_path = os.path.join(MEGnet.__path__[0], 'model_v2k3', 'model_v2.keras')
-        if not os.path.exists(_model_path):
-            print('___MEGqc___: MEGnet model weights missing - downloading from HuggingFace...')
-            os.environ.setdefault('KERAS_BACKEND', 'torch')
-            _megnet_init()
-        if not os.path.exists(_model_path):
-            reason = ('MEGnet model weights unavailable after megnet_init; '
-                      'run `megnet_init` manually to download them')
-            print(f'___MEGqc___: {reason}')
-            result['reason'] = reason
-            return result
-    except Exception as exc:
-        reason = f'MEGnet weight check failed: {exc}'
-        print(f'___MEGqc___: {reason}')
-        result['reason'] = reason
-        return result
-
-    _patch_megnet_notch_filter()
-    _prefer_cpu_for_megnet()
-
-    print('___MEGqc___: Computing MEGnet outputs for ECG/EOG classification...')
-    try:
-        if derivatives_root:
-            cache_dir = os.path.join(os.path.abspath(derivatives_root), '.tmp', 'megnet_cache')
-        else:
-            cache_dir = os.path.join(os.path.abspath(os.getcwd()), '.tmp', 'megnet_cache')
-        os.makedirs(cache_dir, exist_ok=True)
-        outbasename = f"megqc_{hashlib.sha1(data_path.encode('utf-8')).hexdigest()[:12]}"
-
-        run_ica_pipeline(
-            data_path,
-            outbasename=outbasename,
-            mains_freq=50.0,
-            save_preproc=False,
-            save_ica=True,
-            seedval=0,
-            results_dir=cache_dir,
-            filename_raw=None,
-            do_assess_bads=False,
-            bad_channels=[],
-        )
-
-        classes, _, probs = _classify_ica_with_probabilities(
-            results_dir=cache_dir,
-            outbasename=outbasename,
-            filename=data_path,
-        )
-
-        run_dir = os.path.join(cache_dir, outbasename)
-        ica_ts = loadmat(os.path.join(run_dir, 'ICATimeSeries.mat'))['arrICATimeSeries'].T
-
-        classes_arr = np.asarray(classes, dtype=int)
-        probs_arr = np.asarray(probs, dtype=float)
-
-        n_comp = min(ica_ts.shape[0], classes_arr.shape[0], probs_arr.shape[0])
-        classes_arr = classes_arr[:n_comp]
-        probs_arr = probs_arr[:n_comp, :]
-        ica_ts = ica_ts[:n_comp, :]
-
-        ecg_class = int(megnet_params.get('megnet_ecg_class', 2))
-        ecg_idx, ecg_probs = _pick_megnet_components(classes_arr, probs_arr, ecg_class, megnet_params)
-        ecg_signal = _compose_megnet_signal(ica_ts, ecg_idx, ecg_probs)
-
-        eog_primary = int(megnet_params.get('megnet_eog_primary_class', 1))
-        eog_secondary = int(megnet_params.get('megnet_eog_secondary_class', 3))
-        eog_idx, eog_probs = _pick_megnet_components(classes_arr, probs_arr, eog_primary, megnet_params)
-        eog_class_used = eog_primary
-        if eog_idx.size == 0:
-            eog_idx, eog_probs = _pick_megnet_components(classes_arr, probs_arr, eog_secondary, megnet_params)
-            eog_class_used = eog_secondary
-        eog_signal = _compose_megnet_signal(ica_ts, eog_idx, eog_probs)
-
-        print('___MEGqc___: MEGnet outputs computed successfully.')
-        result = {
-            'status': 'ok',
-            'reason': '',
-            'ecg': {
-                'signal': _resample_1d_to_length(ecg_signal, raw.n_times),
-                'component_ids': ecg_idx.tolist(),
-                'component_probs': [float(x) for x in ecg_probs.tolist()],
-                'class_id': ecg_class,
-            } if ecg_signal.size else None,
-            'eog': {
-                'signal': _resample_1d_to_length(eog_signal, raw.n_times),
-                'component_ids': eog_idx.tolist(),
-                'component_probs': [float(x) for x in eog_probs.tolist()],
-                'class_id': eog_class_used,
-            } if eog_signal.size else None,
-        }
-    except Exception as exc:
-        import traceback
-        reason = f'MEGnet execution failed: {exc}'
-        print(f'___MEGqc___: {reason}')
-        traceback.print_exc()
-        result = {
-            'status': 'failed',
-            'reason': reason,
-            'ecg': None,
-            'eog': None,
-        }
-
-    return result
-
 
 def _build_reference_df(
     channel_name: str,
@@ -316,8 +23,14 @@ def _build_reference_df(
     mean_wave_shifted: Union[np.ndarray, None] = None,
     component_ids: Union[List[int], None] = None,
     component_probs: Union[List[float], None] = None,
+    source_name: str = '',
 ) -> pd.DataFrame:
-    """Build a channel-level ECG/EOG dataframe with provenance columns."""
+    """Build a channel-level ECG/EOG dataframe with provenance columns.
+
+    ``source_label`` is the reference's source ("recorded", "mne_reconstructed"
+    or a plugin's name such as "megnet"); ``source_name`` is how a plugin calls
+    itself ("MEGnet"), so a report can name it without the plugin installed.
+    """
     sig = np.asarray(signal).reshape(-1)
     idx_arr = np.asarray(event_indexes).reshape(-1)
     mean_wave = np.asarray(mean_wave).reshape(-1) if mean_wave is not None else np.array([])
@@ -335,6 +48,7 @@ def _build_reference_df(
         'mean_rwave_time': mean_wave_time.tolist() + [None] * max(0, len(sig) - len(mean_wave_time)),
         'recorded_or_reconstructed': [source_label] + [None] * max(0, len(sig) - 1),
         'signal_source': [source_label] + [None] * max(0, len(sig) - 1),
+        'signal_source_label': [source_name] + [None] * max(0, len(sig) - 1),
         'synthetic_component_ids': [','.join(map(str, component_ids or []))] + [None] * max(0, len(sig) - 1),
         'synthetic_component_probs': [','.join([f'{float(p):.6f}' for p in (component_probs or [])])] + [None] * max(0, len(sig) - 1),
         'n_events': [n_events] + [None] * max(0, len(sig) - 1),
@@ -350,35 +64,39 @@ def _build_reference_df(
     return df
 
 
+def _reference_provenance(ref, kind: str) -> dict:
+    """Extra columns for the main reference's dataframe when a plugin's
+    reference took the recorded channel's place (none otherwise)."""
+    if ref is None or ref.signal(kind) is None:
+        return {}
+    sig = ref.signal(kind)
+    return {'component_ids': sig.component_ids, 'component_probs': sig.component_probs,
+            'source_name': ref.label}
+
+
 def _source_from_method(use_method: str) -> str:
+    """The reference's source for a method name: correlation_recorded ->
+    "recorded", correlation_reconstructed (and reconstructed-bad) ->
+    "mne_reconstructed", correlation_<plugin> -> the plugin's name."""
     val = str(use_method).lower()
-    if 'megnet' in val:
-        return 'megnet'
+    if val.startswith('correlation_'):
+        src = val[len('correlation_'):]
+        return {'recorded': 'recorded', 'reconstructed': 'mne_reconstructed'}.get(src, src)
     if 'reconstructed' in val:
         return 'mne_reconstructed'
     return 'recorded'
 
 
-def _apply_lowpass_to_megnet_reference(signal: np.ndarray, sfreq: float, ref_params: dict, ref_kind: str) -> np.ndarray:
-    """Apply optional low-pass filtering to MEGnet synthetic reference only."""
+def _lowpass_reference(signal: np.ndarray, sfreq: float, h_freq: float) -> np.ndarray:
+    """Low-pass a plugin's reference signal (``h_freq`` <= 0: unchanged)."""
     sig = np.asarray(signal, dtype=float).reshape(-1)
-    if sig.size == 0:
-        return sig
-
-    apply_lp = bool(ref_params.get('megnet_lowpass_apply', True))
-    if not apply_lp:
-        return sig
-
-    h_freq = float(ref_params.get('megnet_lowpass_h_freq', 40.0 if ref_kind.upper() == 'ECG' else 20.0))
     nyquist = float(sfreq) / 2.0
-    if h_freq <= 0 or nyquist <= 0:
+    if sig.size == 0 or h_freq <= 0 or nyquist <= 0:
         return sig
-
     if h_freq >= nyquist:
         h_freq = max(nyquist - 0.5, nyquist * 0.95)
     if h_freq <= 0:
         return sig
-
     filtered = mne.filter.filter_data(
         sig[np.newaxis, :],
         sfreq=float(sfreq),
@@ -389,12 +107,14 @@ def _apply_lowpass_to_megnet_reference(signal: np.ndarray, sfreq: float, ref_par
     return np.asarray(filtered[0], dtype=float)
 
 
-def _preprocess_megnet_reference(signal: np.ndarray, ref_kind: str, sfreq: float, ref_params: dict) -> tuple:
-    """Run MEGnet synthetic references through the same per-reference preprocessing used by recorded paths."""
+def _preprocess_synthetic_reference(signal: np.ndarray, ref_kind: str, sfreq: float,
+                                    ref_params: dict, h_freq: float) -> tuple:
+    """Run a plugin's reference through the same per-reference preprocessing
+    used for recorded channels: its low-pass, then peak detection."""
     sig = np.asarray(signal, dtype=float).reshape(-1)
     if sig.size == 0:
         return sig, np.array([], dtype=int), {}
-    sig = _apply_lowpass_to_megnet_reference(sig, sfreq, ref_params, ref_kind)
+    sig = _lowpass_reference(sig, sfreq, h_freq)
 
     if ref_kind.upper() == 'ECG':
         eval_dict, peaks = check_3_conditions(
@@ -1799,6 +1519,13 @@ def find_affected_over_mean(artif_per_ch: List, ecg_or_eog: str, params_internal
 
 
 #%%
+def _is_correlation_method(use_method: str) -> bool:
+    """True for every ``correlation_<source>`` method: correlation_recorded,
+    correlation_reconstructed and a synthetic reference's (correlation_megnet).
+    The channels are ranked the same way whatever the reference's source."""
+    return str(use_method).startswith("correlation_")
+
+
 def make_dict_global_ECG_EOG(channels_ranked: List, use_method: str):
     """
     Make a dictionary for the global part of simple metrics for ECG/EOG artifacts.
@@ -1827,12 +1554,12 @@ def make_dict_global_ECG_EOG(channels_ranked: List, use_method: str):
             metric_global_content = {'details':  affected_chs}
         else:
             metric_global_content = {'details':  None}
-    elif use_method == 'correlation_recorded' or use_method == 'correlation_reconstructed':
+    elif _is_correlation_method(use_method):
         all_affected_channels_sorted = sorted(channels_ranked, key=lambda ch: abs(ch.corr_coef), reverse=True)
         affected_chs = {ch.name: [ch.corr_coef, ch.p_value] for ch in all_affected_channels_sorted}
         metric_global_content = {'details':  affected_chs}
     else:
-        raise ValueError('Unknown method_used: ', use_method)
+        raise ValueError(f'Unknown method_used: {use_method!r}')
 
     return metric_global_content
 
@@ -1868,8 +1595,8 @@ def make_simple_metric_ECG_EOG(channels_ranked: dict, m_or_g_chosen: List, ecg_o
 
     if use_method == 'mean_threshold':
         metric_global_description = 'Here presented the channels with average (over '+ecg_or_eog+' epochs of this channel) ' +ecg_or_eog+ ' artifact above the threshold. Channels are listed here in order from the highest to lowest artifact amplitude. Non affected channels are not listed. Threshld is defined as average '+ecg_or_eog+' artifact peak magnitude over al channels * norm_lvl. norm_lvl is defined in the config file. Channels are presented in the form: ch.name: ch.main_peak_magnitude.'
-    elif use_method == 'correlation_recorded' or use_method == 'correlation_reconstructed':
-        metric_global_description = 'Here the channels are ranked by correlation coefficient between the channel and the averaged '+ecg_or_eog+' channel (recorded or reconstructed). Channels are listed here in order from the highest to lowest correlation coefficient. Channels are presented in the form: ch.name: [ch.corr_coef, ch.p_value]. Sign of the correlation value is kept to reflect the position of the channel toward the magnetic fild omly, it does not reflect the level of contamination (absolute value should be considered for this).'
+    elif _is_correlation_method(use_method):
+        metric_global_description = 'Here the channels are ranked by correlation coefficient between the channel and the averaged '+ecg_or_eog+' reference (' + use_method[len('correlation_'):] + '). Channels are listed here in order from the highest to lowest correlation coefficient. Channels are presented in the form: ch.name: [ch.corr_coef, ch.p_value]. Sign of the correlation value is kept to reflect the position of the channel toward the magnetic fild omly, it does not reflect the level of contamination (absolute value should be considered for this).'
 
     for m_or_g in m_or_g_chosen:
         if channels_ranked[m_or_g]: #if there are affected channels for this channel type
@@ -2532,13 +2259,12 @@ def align_mean_rwave(mean_rwave: np.ndarray, artif_per_ch: List, tmin: float, tm
 #%%
 def ECG_meg_qc(
     ecg_params: dict,
-    megnet_params: dict,
     ecg_params_internal: dict,
     data_path: str,
     channels: List,
     chs_by_lobe_orig: dict,
     m_or_g_chosen: List,
-    megnet_outputs: Union[Dict, None] = None,
+    references: Sequence = (),
 ):
     
     """
@@ -2548,8 +2274,6 @@ def ECG_meg_qc(
     ----------
     ecg_params : dict
         Dictionary with ECG parameters originating from config file.
-    megnet_params : dict
-        Dictionary with MEGnet parameters originating from config file.
     ecg_params_internal : dict
         Dictionary with ECG parameters originating from config file preset, not to be changed by user.
     data_path : str
@@ -2560,8 +2284,9 @@ def ECG_meg_qc(
         Dictionary with lists of channels by lobe.
     m_or_g_chosen : List
         List of channel types chosen for the analysis.
-    megnet_outputs : dict or None
-        Pre-computed MEGnet outputs (optional).
+    references : sequence of SyntheticReference
+        Reference signals from plugins (meg_qc.calculation.references), each
+        used as a fallback, analysed independently, or both, as its settings say.
         
     Returns
     -------
@@ -2594,41 +2319,40 @@ def ECG_meg_qc(
     norm_lvl=ecg_params['norm_lvl']
     gaussian_sigma=ecg_params['gaussian_sigma']
     thresh_lvl_peakfinder=ecg_params['thresh_lvl_peakfinder']
-    megnet_fallback = bool(ecg_params.get('megnet_fallback', False))
-    megnet_independent = bool(ecg_params.get('megnet_independent', False))
-
     ecg_derivs = []
     use_method, ecg_str, ecg_ch_name, ecg_data, event_indexes = get_ECG_data_choose_method(raw, ecg_params)
-    precomputed_megnet_outputs = megnet_outputs
-    megnet_ecg = None
 
-    def _ensure_megnet_ecg():
-        nonlocal precomputed_megnet_outputs, megnet_ecg
-        if precomputed_megnet_outputs is None:
-            return None
-        if megnet_ecg is None and precomputed_megnet_outputs.get('status') == 'ok':
-            megnet_ecg = precomputed_megnet_outputs.get('ecg')
-        return megnet_ecg
+    # Plugin references (e.g. MEGnet) asked for by their settings, and the
+    # ones that produced an ECG signal for this recording.
+    requested_refs = [r for r in references if r.requested('ECG')]
+    usable_refs = [r for r in requested_refs if r.signal('ECG') is not None]
+    fallback_ref = next((r for r in usable_refs if r.wants('ECG', 'fallback')), None)
+    primary_ref = None  # the plugin reference that took the ECG channel's place
 
-    if megnet_independent or use_method == 'no_ecg':
-        _ensure_megnet_ecg()
-
-    if use_method == 'no_ecg':
-        if _ensure_megnet_ecg() is None:
-            simple_metric_ECG = {'description': ecg_str}
-            if precomputed_megnet_outputs is not None:
-                ecg_str += '<br><br>MEGnet was requested but unavailable: ' + str(precomputed_megnet_outputs.get('reason', 'unknown'))
-            print('___MEGqc___: ECG metric skipped — no ECG channel available.')
-            return ecg_derivs, simple_metric_ECG, ecg_str, []
-        ecg_data, event_indexes, _ = _preprocess_megnet_reference(
-            np.asarray(megnet_ecg['signal']),
+    def _use_reference(ref):
+        nonlocal ecg_data, event_indexes, ecg_ch_name, use_method, primary_ref
+        ecg_data, event_indexes, _ = _preprocess_synthetic_reference(
+            np.asarray(ref.signal('ECG').signal),
             'ECG',
             sfreq,
             ecg_params,
+            ref.lowpass_h_freq['ECG'],
         )
-        ecg_ch_name = 'MEGnet_ECG'
-        use_method = 'correlation_megnet'
-        ecg_str += '<br>Using MEGnet ECG candidate because no recorded/reconstructed ECG was available.'
+        ecg_ch_name = ref.channel_name('ECG')
+        use_method = ref.method
+        primary_ref = ref
+
+    if use_method == 'no_ecg':
+        if not usable_refs:
+            simple_metric_ECG = {'description': ecg_str}
+            for ref in requested_refs:
+                ecg_str += (f'<br><br>{ref.label} was requested but unavailable: '
+                            + (ref.reason or 'unknown'))
+            print('___MEGqc___: ECG metric skipped — no ECG channel available.')
+            return ecg_derivs, simple_metric_ECG, ecg_str, []
+        _use_reference(usable_refs[0])
+        ecg_str += (f'<br>Using {primary_ref.label} ECG candidate because no '
+                    'recorded/reconstructed ECG was available.')
 
     n_events = len(event_indexes)
     minutes_in_data = len(ecg_data) / sfreq / 60 if len(ecg_data) > 0 else 0.001
@@ -2640,15 +2364,8 @@ def ECG_meg_qc(
 
     
     if use_method == 'reconstructed-bad': 
-        if megnet_fallback and _ensure_megnet_ecg() is not None:
-            ecg_data, event_indexes, _ = _preprocess_megnet_reference(
-                np.asarray(megnet_ecg['signal']),
-                'ECG',
-                sfreq,
-                ecg_params,
-            )
-            ecg_ch_name = 'MEGnet_ECG'
-            use_method = 'correlation_megnet'
+        if fallback_ref is not None:
+            _use_reference(fallback_ref)
             n_events = len(event_indexes)
             minutes_in_data = len(ecg_data) / sfreq / 60 if len(ecg_data) > 0 else 0.001
             events_rate_per_min = round(n_events / minutes_in_data, 1)
@@ -2656,7 +2373,8 @@ def ECG_meg_qc(
             mean_good, ecg_str_checked, mean_rwave, mean_rwave_time = check_mean_wave(
                 ecg_data, 'ECG', event_indexes, tmin, tmax, sfreq, ecg_params_internal, thresh_lvl_peakfinder
             )
-            ecg_str += '<br><br>Recorded/reconstructed ECG failed checks; switching to MEGnet fallback.'
+            ecg_str += ('<br><br>Recorded/reconstructed ECG failed checks; switching to '
+                        f'{primary_ref.label} fallback.')
             ecg_str += ecg_str_checked + n_events_str
 
         else:
@@ -2686,15 +2404,8 @@ def ECG_meg_qc(
 
     ecg_str += ecg_str_checked + n_events_str
 
-    if mean_good is False and megnet_fallback and use_method != 'correlation_megnet' and _ensure_megnet_ecg() is not None:
-        ecg_data, event_indexes, _ = _preprocess_megnet_reference(
-            np.asarray(megnet_ecg['signal']),
-            'ECG',
-            sfreq,
-            ecg_params,
-        )
-        ecg_ch_name = 'MEGnet_ECG'
-        use_method = 'correlation_megnet'
+    if mean_good is False and primary_ref is None and fallback_ref is not None:
+        _use_reference(fallback_ref)
         n_events = len(event_indexes)
         minutes_in_data = len(ecg_data) / sfreq / 60 if len(ecg_data) > 0 else 0.001
         events_rate_per_min = round(n_events / minutes_in_data, 1)
@@ -2702,7 +2413,8 @@ def ECG_meg_qc(
         mean_good, ecg_str_checked, mean_rwave, mean_rwave_time = check_mean_wave(
             ecg_data, 'ECG', event_indexes, tmin, tmax, sfreq, ecg_params_internal, thresh_lvl_peakfinder
         )
-        ecg_str += '<br><br>Recorded/reconstructed ECG failed checks; switching to MEGnet fallback.'
+        ecg_str += ('<br><br>Recorded/reconstructed ECG failed checks; switching to '
+                    f'{primary_ref.label} fallback.')
         ecg_str += ecg_str_checked + n_events_str
 
     if mean_good is False: 
@@ -2737,8 +2449,7 @@ def ECG_meg_qc(
             mean_wave=np.asarray(mean_rwave),
             mean_wave_time=np.asarray(mean_rwave_time),
             source_label=_source_from_method(use_method),
-            component_ids=(megnet_ecg or {}).get('component_ids') if 'megnet' in _source_from_method(use_method) else None,
-            component_probs=(megnet_ecg or {}).get('component_probs') if 'megnet' in _source_from_method(use_method) else None,
+            **_reference_provenance(primary_ref, 'ECG'),
         )
 
         ecg_derivs += [QC_derivative(content=ecg_ch_df, name='ECGchannel', content_type = 'df')]
@@ -2772,7 +2483,7 @@ def ECG_meg_qc(
             best_affected_channels[m_or_g] = copy.deepcopy(affected_channels[m_or_g])
 
 
-        elif use_method in ('correlation_recorded', 'correlation_reconstructed', 'correlation_megnet'):
+        elif _is_correlation_method(use_method):
 
             #align the mean ECG wave with the ECG artifacts found on meg channels:
             #Find the correlation value between all variations of alignment the mean ECG wave with the ECG artifacts found on meg channels.
@@ -2824,7 +2535,7 @@ def ECG_meg_qc(
             avg_overall_obj = None
 
         else:
-            raise ValueError('use_method should be either mean_threshold or correlation_recorded or correlation_reconstructed')
+            raise ValueError(f'use_method should be mean_threshold or correlation_<source> (recorded, reconstructed or a plugin name), not {use_method!r}')
         
 
         #higher thresh_lvl_peakfinder - more peaks will be found on the eog artifact for both separate channels and average overall. As a result, average overll may change completely, since it is centered around the peaks of 5 most prominent channels.
@@ -2840,8 +2551,7 @@ def ECG_meg_qc(
         mean_wave_time=np.asarray(mean_rwave_time),
         source_label=_source_from_method(use_method),
         mean_wave_shifted=np.asarray(best_mean_rwave_shifted),
-        component_ids=(megnet_ecg or {}).get('component_ids') if 'megnet' in _source_from_method(use_method) else None,
-        component_probs=(megnet_ecg or {}).get('component_probs') if 'megnet' in _source_from_method(use_method) else None,
+        **_reference_provenance(primary_ref, 'ECG'),
     )
 
     ecg_derivs += [QC_derivative(content=ecg_ch_df, name='ECGchannel', content_type='df')]
@@ -2863,37 +2573,41 @@ def ECG_meg_qc(
 
     ecg_derivs += ecg_csv_deriv
 
-    if megnet_ecg is not None:
-        megnet_signal, megnet_events, _ = _preprocess_megnet_reference(
-            np.asarray(megnet_ecg.get('signal', np.array([]))),
+    # A plugin reference analysed on its own (independent), or the one that
+    # replaced the ECG channel: written as desc-ECGchannel<plugin> and
+    # desc-ECGs<plugin> beside the main result.
+    for ref in [r for r in usable_refs if r.wants('ECG', 'independent') or r is primary_ref]:
+        ref_signal, ref_events, _ = _preprocess_synthetic_reference(
+            np.asarray(ref.signal('ECG').signal),
             'ECG',
             sfreq,
             ecg_params,
+            ref.lowpass_h_freq['ECG'],
         )
 
-        megnet_mean_good, _, megnet_mean_wave, megnet_mean_time = check_mean_wave(
-            megnet_signal,
+        ref_mean_good, _, ref_mean_wave, ref_mean_time = check_mean_wave(
+            ref_signal,
             'ECG',
-            megnet_events,
+            ref_events,
             tmin,
             tmax,
             sfreq,
             ecg_params_internal,
             thresh_lvl_peakfinder,
         )
-        megnet_shifted = megnet_mean_wave if megnet_mean_good else None
-        if megnet_mean_good and m_or_g_chosen:
-            # Reuse one channel type to estimate a shifted mean for MEGnet export consistency.
+        ref_shifted = ref_mean_wave if ref_mean_good else None
+        if ref_mean_good and m_or_g_chosen:
+            # Reuse one channel type to estimate a shifted mean for the reference's export.
             meg_epochs = mne.Epochs(
                 raw,
-                np.column_stack([np.asarray(megnet_events, dtype=int), np.zeros(len(megnet_events), dtype=int), np.ones(len(megnet_events), dtype=int)]),
+                np.column_stack([np.asarray(ref_events, dtype=int), np.zeros(len(ref_events), dtype=int), np.ones(len(ref_events), dtype=int)]),
                 event_id=1,
                 tmin=tmin,
                 tmax=tmax,
                 picks=channels[m_or_g_chosen[0]],
                 preload=True,
                 baseline=None,
-            ) if len(megnet_events) > 0 else None
+            ) if len(ref_events) > 0 else None
             if meg_epochs is not None and len(meg_epochs) > 0:
                 meg_artif = calculate_artifacts_on_channels(
                     meg_epochs,
@@ -2905,31 +2619,32 @@ def ECG_meg_qc(
                     params_internal=ecg_params_internal,
                     gaussian_sigma=gaussian_sigma,
                 )
-                shifted_variants = align_mean_rwave(megnet_mean_wave, meg_artif, tmin, tmax)
+                shifted_variants = align_mean_rwave(ref_mean_wave, meg_artif, tmin, tmax)
                 if shifted_variants:
-                    megnet_shifted = shifted_variants[0]
+                    ref_shifted = shifted_variants[0]
 
-        ecg_megnet_df = _build_reference_df(
-            channel_name='MEGnet_ECG',
-            signal=megnet_signal,
-            event_indexes=np.asarray(megnet_events),
+        ecg_ref_df = _build_reference_df(
+            channel_name=ref.channel_name('ECG'),
+            signal=ref_signal,
+            event_indexes=np.asarray(ref_events),
             sfreq=raw.info['sfreq'],
-            mean_wave=np.asarray(megnet_mean_wave),
-            mean_wave_time=np.asarray(megnet_mean_time),
-            source_label='megnet',
-            mean_wave_shifted=np.asarray(megnet_shifted) if megnet_shifted is not None else None,
-            component_ids=megnet_ecg.get('component_ids'),
-            component_probs=megnet_ecg.get('component_probs'),
+            mean_wave=np.asarray(ref_mean_wave),
+            mean_wave_time=np.asarray(ref_mean_time),
+            source_label=ref.source,
+            source_name=ref.label,
+            mean_wave_shifted=np.asarray(ref_shifted) if ref_shifted is not None else None,
+            component_ids=ref.signal('ECG').component_ids,
+            component_probs=ref.signal('ECG').component_probs,
         )
-        ecg_derivs += [QC_derivative(content=ecg_megnet_df, name='ECGchannelmegnet', content_type='df')]
+        ecg_derivs += [QC_derivative(content=ecg_ref_df, name=f'ECGchannel{ref.source}', content_type='df')]
 
-        megnet_chs_by_lobe = copy.deepcopy(chs_by_lobe)
+        ref_chs_by_lobe = copy.deepcopy(chs_by_lobe)
         meg_time = np.round(np.arange(tmin, tmax + 1 / sfreq, 1 / sfreq), 3)
-        if len(megnet_events) > 0 and len(megnet_mean_wave) > 0:
+        if len(ref_events) > 0 and len(ref_mean_wave) > 0:
             for m_or_g in m_or_g_chosen:
                 meg_epochs = mne.Epochs(
                     raw,
-                    np.column_stack([np.asarray(megnet_events, dtype=int), np.zeros(len(megnet_events), dtype=int), np.ones(len(megnet_events), dtype=int)]),
+                    np.column_stack([np.asarray(ref_events, dtype=int), np.zeros(len(ref_events), dtype=int), np.ones(len(ref_events), dtype=int)]),
                     event_id=1,
                     tmin=tmin,
                     tmax=tmax,
@@ -2940,23 +2655,23 @@ def ECG_meg_qc(
                 meg_artif = calculate_artifacts_on_channels(
                     meg_epochs,
                     channels[m_or_g],
-                    chs_by_lobe=megnet_chs_by_lobe[m_or_g],
+                    chs_by_lobe=ref_chs_by_lobe[m_or_g],
                     thresh_lvl_peakfinder=thresh_lvl_peakfinder,
                     tmin=tmin,
                     tmax=tmax,
                     params_internal=ecg_params_internal,
                     gaussian_sigma=gaussian_sigma,
                 )
-                ranked = find_affected_by_correlation(np.asarray(megnet_mean_wave), meg_artif)
+                ranked = find_affected_by_correlation(np.asarray(ref_mean_wave), meg_artif)
                 if ranked is None:
                     ranked = meg_artif
                 ranked = find_affected_by_amplitude_ratio(ranked)
                 ranked = find_affected_by_similarity_score(ranked)
-                for lobe, lobe_channels in megnet_chs_by_lobe[m_or_g].items():
+                for lobe, lobe_channels in ref_chs_by_lobe[m_or_g].items():
                     for lobe_ch in lobe_channels:
                         lobe_ch.add_ecg_info(ranked, meg_time)
 
-            ecg_derivs += chs_dict_to_csv(megnet_chs_by_lobe, file_name_prefix='ECGsmegnet')
+            ecg_derivs += chs_dict_to_csv(ref_chs_by_lobe, file_name_prefix=f'ECGs{ref.source}')
 
     return ecg_derivs, simple_metric_ECG, ecg_str, avg_objects_ecg
 
@@ -2964,13 +2679,12 @@ def ECG_meg_qc(
 #%%
 def EOG_meg_qc(
     eog_params: dict,
-    megnet_params: dict,
     eog_params_internal: dict,
     data_path: str,
     channels: dict,
     chs_by_lobe_orig: dict,
     m_or_g_chosen: List,
-    megnet_outputs: Union[Dict, None] = None,
+    references: Sequence = (),
 ):
     
     """
@@ -2980,8 +2694,6 @@ def EOG_meg_qc(
     ----------
     eog_params : dict
         Dictionary with EOG parameters originating from the config file.
-    megnet_params : dict
-        Dictionary with MEGnet parameters originating from config file.
     eog_params_internal : dict
         Dictionary with EOG parameters originating from the config file - preset for internal use, not to be changed by the user.
     data_path : str
@@ -2992,8 +2704,9 @@ def EOG_meg_qc(
         Dictionary with lists of channels separated by lobe.
     m_or_g_chosen : List
         List of channel types chosen for the analysis.
-    megnet_outputs : dict or None
-        Pre-computed MEGnet outputs (optional).
+    references : sequence of SyntheticReference
+        Reference signals from plugins (meg_qc.calculation.references), each
+        used as a fallback, analysed independently, or both, as its settings say.
         
     Returns
     -------
@@ -3021,42 +2734,39 @@ def EOG_meg_qc(
     norm_lvl=eog_params['norm_lvl']
     gaussian_sigma=eog_params['gaussian_sigma']
     thresh_lvl_peakfinder=eog_params['thresh_lvl_peakfinder']
-    megnet_fallback = bool(eog_params.get('megnet_fallback', False))
-    megnet_independent = bool(eog_params.get('megnet_independent', False))
-
     eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw, eog_params)
-    precomputed_megnet_outputs = megnet_outputs
-    megnet_eog = None
 
-    def _ensure_megnet_eog():
-        nonlocal precomputed_megnet_outputs, megnet_eog
-        if precomputed_megnet_outputs is None:
-            return None
-        if megnet_eog is None and precomputed_megnet_outputs.get('status') == 'ok':
-            megnet_eog = precomputed_megnet_outputs.get('eog')
-        return megnet_eog
+    # Plugin references (e.g. MEGnet) asked for by their settings, and the
+    # ones that produced an EOG signal for this recording.
+    requested_refs = [r for r in references if r.requested('EOG')]
+    usable_refs = [r for r in requested_refs if r.signal('EOG') is not None]
+    fallback_ref = next((r for r in usable_refs if r.wants('EOG', 'fallback')), None)
+    primary_ref = None  # the plugin reference that took the EOG channel's place
 
-    if megnet_independent or len(eog_data) == 0:
-        _ensure_megnet_eog()
-
-    eog_derivs = []
-    if len(eog_data) == 0:
-        if _ensure_megnet_eog() is None:
-            simple_metric_EOG = {'description': eog_str}
-            if precomputed_megnet_outputs is not None:
-                eog_str += '<br><br>MEGnet was requested but unavailable: ' + str(precomputed_megnet_outputs.get('reason', 'unknown'))
-            return eog_derivs, simple_metric_EOG, eog_str, []
-
-        prep_sig, prep_events, _ = _preprocess_megnet_reference(
-            np.asarray(megnet_eog['signal']),
+    def _reference_signal(ref):
+        return _preprocess_synthetic_reference(
+            np.asarray(ref.signal('EOG').signal),
             'EOG',
             sfreq,
             eog_params,
+            ref.lowpass_h_freq['EOG'],
         )
+
+    eog_derivs = []
+    if len(eog_data) == 0:
+        if not usable_refs:
+            simple_metric_EOG = {'description': eog_str}
+            for ref in requested_refs:
+                eog_str += (f'<br><br>{ref.label} was requested but unavailable: '
+                            + (ref.reason or 'unknown'))
+            return eog_derivs, simple_metric_EOG, eog_str, []
+
+        primary_ref = usable_refs[0]
+        prep_sig, prep_events, _ = _reference_signal(primary_ref)
         eog_data = [prep_sig]
-        eog_ch_name = ['MEGnet_EOG']
+        eog_ch_name = [primary_ref.channel_name('EOG')]
         event_indexes = [prep_events.tolist()]
-        eog_str = 'No recorded EOG channels found. Using MEGnet EOG candidate.'
+        eog_str = f'No recorded EOG channels found. Using {primary_ref.label} EOG candidate.'
 
 
     # Now choose the channel with blinks only (if there are several):
@@ -3074,7 +2784,7 @@ def EOG_meg_qc(
     print('___MEGqc___: ', 'Blink rate per minute: ', events_rate_per_min)
     n_events_str += '<br>Blink rate per minute: ' + str(events_rate_per_min)
 
-    use_method = 'correlation_megnet' if eog_ch_name == 'MEGnet_EOG' else 'correlation_recorded' #'mean_threshold'
+    use_method = primary_ref.method if primary_ref is not None else 'correlation_recorded' #'mean_threshold'
     #no need to choose method in EOG because we cant reconstruct channel, always correlaion on recorded ch (if channel present) or fail.
 
     
@@ -3090,27 +2800,22 @@ def EOG_meg_qc(
         mean_wave=np.asarray(mean_blink),
         mean_wave_time=np.asarray(mean_rwave_time),
         source_label=_source_from_method(use_method),
-        component_ids=(megnet_eog or {}).get('component_ids') if 'megnet' in _source_from_method(use_method) else None,
-        component_probs=(megnet_eog or {}).get('component_probs') if 'megnet' in _source_from_method(use_method) else None,
+        **_reference_provenance(primary_ref, 'EOG'),
     )
 
     eog_derivs += [QC_derivative(content=eog_ch_df, name='EOGchannel', content_type = 'df')]
     
 
     if mean_good is False:
-        if megnet_fallback and use_method != 'correlation_megnet' and _ensure_megnet_eog() is not None:
-            eog_data, event_indexes, _ = _preprocess_megnet_reference(
-                np.asarray(megnet_eog['signal']),
-                'EOG',
-                sfreq,
-                eog_params,
-            )
-            eog_ch_name = 'MEGnet_EOG'
-            use_method = 'correlation_megnet'
+        if primary_ref is None and fallback_ref is not None:
+            primary_ref = fallback_ref
+            eog_data, event_indexes, _ = _reference_signal(primary_ref)
+            eog_ch_name = primary_ref.channel_name('EOG')
+            use_method = primary_ref.method
             mean_good, eog_str_checked, mean_blink, mean_rwave_time = check_mean_wave(
                 eog_data, 'EOG', event_indexes, tmin, tmax, sfreq, eog_params_internal, thresh_lvl_peakfinder
             )
-            eog_str += '<br><br>Recorded EOG failed checks; switching to MEGnet fallback.'
+            eog_str += f'<br><br>Recorded EOG failed checks; switching to {primary_ref.label} fallback.'
             if mean_good:
                 eog_ch_df = _build_reference_df(
                     channel_name=eog_ch_name,
@@ -3119,9 +2824,8 @@ def EOG_meg_qc(
                     sfreq=raw.info['sfreq'],
                     mean_wave=np.asarray(mean_blink),
                     mean_wave_time=np.asarray(mean_rwave_time),
-                    source_label='megnet',
-                    component_ids=megnet_eog.get('component_ids'),
-                    component_probs=megnet_eog.get('component_probs'),
+                    source_label=primary_ref.source,
+                    **_reference_provenance(primary_ref, 'EOG'),
                 )
                 eog_derivs = [QC_derivative(content=eog_ch_df, name='EOGchannel', content_type='df')]
                 n_events = len(event_indexes)
@@ -3129,7 +2833,7 @@ def EOG_meg_qc(
                 events_rate_per_min = round(n_events / minutes_in_data, 1)
                 n_events_str = '<br><br>EOG events detected: ' + str(n_events) + '<br>Blink rate per minute: ' + str(events_rate_per_min)
                 eog_str += eog_str_checked + n_events_str
-                # Continue into normal contamination pipeline with MEGnet source.
+                # Continue into the normal contamination pipeline with the plugin's reference.
 
         if mean_good is False:
             if n_events > 0:
@@ -3195,7 +2899,7 @@ def EOG_meg_qc(
             best_affected_channels[m_or_g] = copy.deepcopy(affected_channels[m_or_g])
 
 
-        elif use_method in ('correlation_recorded', 'correlation_reconstructed', 'correlation_megnet'):
+        elif _is_correlation_method(use_method):
 
             affected_channels[m_or_g] = find_affected_by_correlation(mean_blink, artif_per_ch)
             bad_avg_str[m_or_g] = ''
@@ -3238,18 +2942,22 @@ def EOG_meg_qc(
 
     eog_derivs += eog_csv_deriv
 
-    if megnet_eog is not None:
-        megnet_signal, megnet_events, _ = _preprocess_megnet_reference(
-            np.asarray(megnet_eog.get('signal', np.array([]))),
+    # A plugin reference analysed on its own (independent), or the one that
+    # replaced the EOG channel: written as desc-EOGchannel<plugin> and
+    # desc-EOGs<plugin> beside the main result.
+    for ref in [r for r in usable_refs if r.wants('EOG', 'independent') or r is primary_ref]:
+        ref_signal, ref_events, _ = _preprocess_synthetic_reference(
+            np.asarray(ref.signal('EOG').signal),
             'EOG',
             sfreq,
             eog_params,
+            ref.lowpass_h_freq['EOG'],
         )
 
-        _, _, megnet_mean_wave, megnet_mean_time = check_mean_wave(
-            megnet_signal,
+        _, _, ref_mean_wave, ref_mean_time = check_mean_wave(
+            ref_signal,
             'EOG',
-            megnet_events,
+            ref_events,
             tmin,
             tmax,
             sfreq,
@@ -3257,26 +2965,27 @@ def EOG_meg_qc(
             thresh_lvl_peakfinder,
         )
 
-        eog_megnet_df = _build_reference_df(
-            channel_name='MEGnet_EOG',
-            signal=megnet_signal,
-            event_indexes=np.asarray(megnet_events),
+        eog_ref_df = _build_reference_df(
+            channel_name=ref.channel_name('EOG'),
+            signal=ref_signal,
+            event_indexes=np.asarray(ref_events),
             sfreq=raw.info['sfreq'],
-            mean_wave=np.asarray(megnet_mean_wave),
-            mean_wave_time=np.asarray(megnet_mean_time),
-            source_label='megnet',
-            component_ids=megnet_eog.get('component_ids'),
-            component_probs=megnet_eog.get('component_probs'),
+            mean_wave=np.asarray(ref_mean_wave),
+            mean_wave_time=np.asarray(ref_mean_time),
+            source_label=ref.source,
+            source_name=ref.label,
+            component_ids=ref.signal('EOG').component_ids,
+            component_probs=ref.signal('EOG').component_probs,
         )
-        eog_derivs += [QC_derivative(content=eog_megnet_df, name='EOGchannelmegnet', content_type='df')]
+        eog_derivs += [QC_derivative(content=eog_ref_df, name=f'EOGchannel{ref.source}', content_type='df')]
 
-        megnet_chs_by_lobe = copy.deepcopy(chs_by_lobe)
+        ref_chs_by_lobe = copy.deepcopy(chs_by_lobe)
         meg_time = np.round(np.arange(tmin, tmax + 1 / sfreq, 1 / sfreq), 3)
-        if len(megnet_events) > 0 and len(megnet_mean_wave) > 0:
+        if len(ref_events) > 0 and len(ref_mean_wave) > 0:
             for m_or_g in m_or_g_chosen:
                 meg_epochs = mne.Epochs(
                     raw,
-                    np.column_stack([np.asarray(megnet_events, dtype=int), np.zeros(len(megnet_events), dtype=int), np.ones(len(megnet_events), dtype=int)]),
+                    np.column_stack([np.asarray(ref_events, dtype=int), np.zeros(len(ref_events), dtype=int), np.ones(len(ref_events), dtype=int)]),
                     event_id=1,
                     tmin=tmin,
                     tmax=tmax,
@@ -3287,22 +2996,22 @@ def EOG_meg_qc(
                 meg_artif = calculate_artifacts_on_channels(
                     meg_epochs,
                     channels[m_or_g],
-                    chs_by_lobe=megnet_chs_by_lobe[m_or_g],
+                    chs_by_lobe=ref_chs_by_lobe[m_or_g],
                     thresh_lvl_peakfinder=thresh_lvl_peakfinder,
                     tmin=tmin,
                     tmax=tmax,
                     params_internal=eog_params_internal,
                     gaussian_sigma=gaussian_sigma,
                 )
-                ranked = find_affected_by_correlation(np.asarray(megnet_mean_wave), meg_artif)
+                ranked = find_affected_by_correlation(np.asarray(ref_mean_wave), meg_artif)
                 if ranked is None:
                     ranked = meg_artif
                 ranked = find_affected_by_amplitude_ratio(ranked)
                 ranked = find_affected_by_similarity_score(ranked)
-                for lobe, lobe_channels in megnet_chs_by_lobe[m_or_g].items():
+                for lobe, lobe_channels in ref_chs_by_lobe[m_or_g].items():
                     for lobe_ch in lobe_channels:
                         lobe_ch.add_eog_info(ranked, meg_time)
 
-            eog_derivs += chs_dict_to_csv(megnet_chs_by_lobe, file_name_prefix='EOGsmegnet')
+            eog_derivs += chs_dict_to_csv(ref_chs_by_lobe, file_name_prefix=f'EOGs{ref.source}')
 
     return eog_derivs, simple_metric_EOG, eog_str, avg_objects_eog

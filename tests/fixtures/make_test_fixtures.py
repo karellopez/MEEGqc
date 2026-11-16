@@ -40,7 +40,10 @@ Usage
 
 Then bundle and (optionally) upload::
 
-    tar -czf meegqc_test_data.tar.gz -C /path/to meegqc_test_data
+    COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --exclude='.DS_Store' \
+        -czf meegqc_test_data.tar.gz -C /path/to meegqc_test_data
+
+(The flags matter on macOS: plain tar adds a hidden ._<name> file per file.)
 """
 from __future__ import annotations
 

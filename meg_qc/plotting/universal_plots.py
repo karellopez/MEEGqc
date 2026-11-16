@@ -14,6 +14,7 @@ from typing import List, Optional, Sequence, Tuple, Dict, Any
 import matplotlib.pyplot as plt
 from mne.preprocessing import compute_average_dev_head_t
 from meg_qc.calculation.objects import QC_derivative, MEG_channel
+from meg_qc.plotting.reference_sources import plugin_source_of_name, source_label as reference_source_label
 from meg_qc.plotting.topomap_2d import make_flat_topomap_figure, make_flat_sensor_figure, BLUE_RED_COLORSCALE, COLORMAP_OPTIONS
 import matplotlib #this is in case we will need to suppress mne matplotlib plots
 
@@ -21,6 +22,13 @@ import matplotlib #this is in case we will need to suppress mne matplotlib plots
 # mne.viz.set_browser_backend('matplotlib')
 # matplotlib.use('Agg') 
 #this command will suppress showing matplotlib figures produced by mne. They will still be saved for use in report but not shown when running the pipeline
+
+
+
+#: The edges of a quantile band: the band is the fill between two lines that
+#: must never be drawn themselves. Width 0 AND a transparent colour, so no
+#: control that changes line widths can make them appear.
+_BAND_EDGE = dict(width=0, color='rgba(0,0,0,0)')
 
 
 def _add_solid_cap_toggle_to_3d_figure(fig: go.Figure, x_vals, y_vals, z_vals) -> None:
@@ -1829,19 +1837,19 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
 
     # Top panel quantile bands.
     fig.add_trace(
-        go.Scatter(x=epoch_labels, y=q95_epoch, mode='lines', line=dict(width=0), name='Middle 90% of channels', hoverinfo='skip'),
+        go.Scatter(x=epoch_labels, y=q95_epoch, mode='lines', line=_BAND_EDGE, name='Middle 90% of channels', legendgroup='band90', showlegend=False, hoverinfo='skip'),
         row=1, col=1
     )
     fig.add_trace(
-        go.Scatter(x=epoch_labels, y=q05_epoch, mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(31,119,180,0.15)', name='Middle 90% of channels', hoverinfo='skip', showlegend=False),
+        go.Scatter(x=epoch_labels, y=q05_epoch, mode='lines', line=_BAND_EDGE, fill='tonexty', fillcolor='rgba(31,119,180,0.15)', name='Middle 90% of channels', legendgroup='band90', hoverinfo='skip'),
         row=1, col=1
     )
     fig.add_trace(
-        go.Scatter(x=epoch_labels, y=q75_epoch, mode='lines', line=dict(width=0), name='Middle 50% of channels', hoverinfo='skip'),
+        go.Scatter(x=epoch_labels, y=q75_epoch, mode='lines', line=_BAND_EDGE, name='Middle 50% of channels', legendgroup='band50', showlegend=False, hoverinfo='skip'),
         row=1, col=1
     )
     fig.add_trace(
-        go.Scatter(x=epoch_labels, y=q25_epoch, mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(31,119,180,0.34)', name='Middle 50% of channels', hoverinfo='skip', showlegend=False),
+        go.Scatter(x=epoch_labels, y=q25_epoch, mode='lines', line=_BAND_EDGE, fill='tonexty', fillcolor='rgba(31,119,180,0.34)', name='Middle 50% of channels', legendgroup='band50', hoverinfo='skip'),
         row=1, col=1
     )
     fig.add_trace(
@@ -1904,7 +1912,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
             x=q95_channel,
             y=channel_idx,
             mode='lines',
-            line=dict(width=0),
+            line=_BAND_EDGE,
             name='Middle 90% of epochs',
             showlegend=False,
             hoverinfo='skip',
@@ -1916,7 +1924,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
             x=q05_channel,
             y=channel_idx,
             mode='lines',
-            line=dict(width=0),
+            line=_BAND_EDGE,
             fill='tonextx',
             fillcolor='rgba(31,119,180,0.15)',
             name='Middle 90% of epochs',
@@ -1930,7 +1938,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
             x=q75_channel,
             y=channel_idx,
             mode='lines',
-            line=dict(width=0),
+            line=_BAND_EDGE,
             name='Middle 50% of epochs',
             showlegend=False,
             hoverinfo='skip',
@@ -1942,7 +1950,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
             x=q25_channel,
             y=channel_idx,
             mode='lines',
-            line=dict(width=0),
+            line=_BAND_EDGE,
             fill='tonextx',
             fillcolor='rgba(31,119,180,0.34)',
             name='Middle 50% of epochs',
@@ -4299,7 +4307,9 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
 
     for tsv_path in tsv_paths:
         basename = os.path.basename(tsv_path)
-        is_megnet_tsv = 'megnet' in basename.lower()
+        # A plugin's reference (e.g. desc-ECGsmegnet): its figures carry the
+        # plugin's name, so the report can tab them apart from MEGqc's own.
+        plugin_source = plugin_source_of_name(basename)
 
         def _extend_safe(target: list, func, *args, **kwargs) -> None:
             """Run one plotting builder safely; keep other figures on failure."""
@@ -4309,10 +4319,13 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
                 print(f"___MEGqc___: Skipping plot '{func.__name__}' for '{basename}': {exc}")
                 return
             if out:
-                if is_megnet_tsv:
+                if plugin_source:
+                    label = reference_source_label(plugin_source, tsv_path)
                     for d in out:
-                        if not d.name.endswith('-megnet'):
-                            d.name = d.name + '-megnet'
+                        if not d.name.endswith(f'-{plugin_source}'):
+                            d.name = d.name + f'-{plugin_source}'
+                        d.reference_source = plugin_source
+                        d.reference_label = label
                 target += out
 
         if 'desc-stimulus' in basename:

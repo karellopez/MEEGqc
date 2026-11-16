@@ -10,6 +10,8 @@
 
 import sys
 import os
+import re
+import locale
 import signal
 import json
 import time
@@ -218,7 +220,7 @@ except Exception as _webengine_exc:
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 # Attempt to import psutil for accurate RAM info; if unavailable, fallback later
 try:
@@ -243,8 +245,8 @@ from PyQt6.QtCore import (
     pyqtSignal,
     Qt,
     QCoreApplication,
-    QSettings,
     QTimer,
+    QLocale,
     QStandardPaths,
     QUrl,
 )
@@ -259,9 +261,41 @@ from meg_qc.test import (
     validate_plot_request,
 )
 from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
+from meg_qc.output_paths import dataset_derivatives_output
+from meg_qc.plugins.api import USES as REFERENCE_USES
+from meg_qc.plugins.registry import plugins as registry_plugins, reference_providers
+from meg_qc.calculation.resource_budget import (
+    DEFAULT_GUARD_LEVEL, GUARD_LEVELS, level_values, memory_total_bytes,
+    usable_bytes,
+)
 from meg_qc import __version__ as MEGQC_VERSION
 # Output monitoring: live terminal streaming + CLI launcher
 from .output_monitoring import LiveTerminalDialog, open_cli_terminal
+from .settings_store import settings_store
+
+def _use_c_time_locale() -> None:
+    """Put the TIME locale back to "C" after Qt has started.
+
+    On Linux and macOS a QApplication switches the process to the system's
+    locale. MNE parses dates in recording headers with locale-dependent month
+    names: a CTF file dated "01-Jan-1925" fails with "Illegal date" in any
+    process whose time locale is not English (seen on a Spanish LC_TIME). Qt
+    already keeps numbers in "C"; this does the same for dates. Call it once,
+    right after the QApplication exists and before any thread starts.
+    """
+    try:
+        locale.setlocale(locale.LC_TIME, "C")
+    except locale.Error:
+        pass
+
+
+#: Shown when plotting or GQI is asked for a new profile without an ID. Uses the
+#: names the "Analysis mode" menu shows.
+_NEW_PROFILE_NEEDS_ID = (
+    '"New profile" needs a profile ID for {action}.\n'
+    'Choose "Reuse profile" and enter an ID, or use "Latest profile" or '
+    '"Non-profile (single run)".'
+)
 from .update_widgets import check_for_updates_interactive, run_startup_check
 # Use Qt built-in dialogs (consistent cross-platform behaviour)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
@@ -370,10 +404,11 @@ class Worker(QObject):
     error = pyqtSignal(str)
     output_ready = pyqtSignal(str)  # emits captured stdout/stderr lines
 
-    def __init__(self, func, *args):
+    def __init__(self, func, *args, **kwargs):
         super().__init__()
         self.func = func
         self.args = args
+        self.kwargs = kwargs
         self.process: Optional[QProcess] = None
         self._stopped_by_user = False
         self._had_error = False
@@ -382,7 +417,7 @@ class Worker(QObject):
     # Process lifecycle helpers
     # ------------------------------------------------------------------
     def _build_payload(self) -> str:
-        """JSON-encode ``self.args`` converting Paths to strings recursively."""
+        """JSON-encode ``{"args": ..., "kwargs": ...}``, Paths as strings."""
 
         def convert(value):
             if isinstance(value, Path):
@@ -393,8 +428,9 @@ class Worker(QObject):
                 return {str(key): convert(val) for key, val in value.items()}
             return value
 
-        normalized = [convert(arg) for arg in self.args]
-        return json.dumps(normalized, ensure_ascii=False)
+        return json.dumps(
+            {"args": convert(list(self.args)), "kwargs": convert(self.kwargs)},
+            ensure_ascii=False)
 
     def _cleanup(self) -> None:
         """Release the ``QProcess`` instance and reset transient flags."""
@@ -572,10 +608,10 @@ def _migrate_legacy_megqc_state() -> None:
     """
     # 1. QSettings migration ----------------------------------------------
     try:
-        new = QSettings("ANCP", "MEEGqc")
+        new = settings_store("MEEGqc")
         if not bool(new.value(_MIGRATION_MARKER_KEY, False, type=bool)):
             # 1a. Main GUI store.
-            old = QSettings("ANCP", "MEGqc")
+            old = settings_store("MEGqc")
             for key in _QSETTINGS_KEYS_TO_MIGRATE:
                 value = old.value(key)
                 if value is not None:
@@ -584,8 +620,8 @@ def _migrate_legacy_megqc_state() -> None:
             # 1b. QC Viewer store (the viewer uses its own QSettings
             #     org/app pair so its state survives reinstalls of the
             #     main GUI).
-            new_viewer = QSettings("ANCP", "MEEGqc_Viewer")
-            old_viewer = QSettings("ANCP", "MEGqc_Viewer")
+            new_viewer = settings_store("MEEGqc_Viewer")
+            old_viewer = settings_store("MEGqc_Viewer")
             for key in _VIEWER_QSETTINGS_KEYS_TO_MIGRATE:
                 value = old_viewer.value(key)
                 if value is not None:
@@ -656,16 +692,18 @@ class SettingsEditorDialog(QDialog):
     def __init__(self, source_path: Union[str, Path], defaults_path: Union[str, Path], title: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(1080, 760)
 
         self.source_path = Path(source_path)
         self.defaults_path = Path(defaults_path)
         # Build an editor model from package defaults first, then overlay
         # user/runtime values. This keeps the GUI aligned to supported keys and
         # silently drops deprecated legacy options from older profiles.
+        # The packaged defaults plus the section of every installed plugin
+        # (e.g. MEGnet's [MEGNET]), so a plugin's settings are edited here too.
+        self._defaults_text = self._read_defaults(self.defaults_path)
         self.template_config = configparser.ConfigParser()
         self.template_config.optionxform = str
-        self.template_config.read(self.defaults_path)
+        self.template_config.read_string(self._defaults_text)
 
         source_cfg = configparser.ConfigParser()
         source_cfg.optionxform = str
@@ -686,7 +724,18 @@ class SettingsEditorDialog(QDialog):
         if not self.config.sections():
             self.config.read(self.source_path)
 
-        self.comment_map = self._build_comment_map(self.defaults_path)
+        # Sections this MEEGqc does not show (a plugin that is not installed
+        # here, e.g. after removing it) are kept as they are when saving.
+        self._kept_sections = {
+            section: dict(source_cfg[section]) for section in source_cfg.sections()
+            if section not in self.template_config}
+
+        self.comment_map = self._build_comment_map(self._defaults_text)
+        # A reference plugin's ecg/eog keys take a fixed set of values.
+        self._enum_options = dict(self._ENUM_OPTIONS)
+        for plugin in reference_providers():
+            for key in ("ecg", "eog"):
+                self._enum_options[(plugin.settings_section, key)] = list(REFERENCE_USES)
         self.widgets: Dict[Tuple[str, str], Tuple[QWidget, str]] = {}
         # Track each row's label and each section's group box so the grey-out
         # system can dim the whole row (label + field) and whole sections, and
@@ -708,8 +757,6 @@ class SettingsEditorDialog(QDialog):
         sections = self._ordered_sections()
         for idx, section in enumerate(sections):
             box = QGroupBox(section)
-            box.setMinimumWidth(260)
-            box.setMaximumWidth(360)
             self.section_boxes[section] = box
             form = QFormLayout(box)
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
@@ -717,7 +764,7 @@ class SettingsEditorDialog(QDialog):
                 widget, widget_type = self._build_widget(section, key, str(val))
                 self.widgets[(section, key)] = (widget, widget_type)
                 tip = self.comment_map.get((section, key), "")
-                label = QLabel(key)
+                label = self._name_label(key)
                 if tip:
                     label.setToolTip(tip)
                     widget.setToolTip(tip)
@@ -727,6 +774,7 @@ class SettingsEditorDialog(QDialog):
 
         scroll.setWidget(container)
         root.addWidget(scroll)
+        self._fit_section_boxes(container, scroll)
 
         # Wire the grey-out system AFTER all widgets are built.
         self._wire_apply_filtering_toggle()
@@ -747,6 +795,47 @@ class SettingsEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    #: Widest a setting name may be beside its field. A longer name (e.g.
+    #: min_distance_between_different_muscle_events) continues on the next
+    #: line, broken after an underscore, instead of being cut off.
+    _NAME_WIDTH = 155
+    # Section boxes stay compact in a wide window, but are never narrower than
+    # their names and fields need: an explicit minimum of 260 px let the grid
+    # squeeze a box, and with Windows' Segoe UI the form then cut
+    # allowed_range_of_peaks_stds. A narrower window scrolls sideways instead.
+    _BOX_MAX_WIDTH = 360
+    _OPEN_SIZE = (1080, 760)
+
+    def _fit_section_boxes(self, container: QWidget, scroll: QScrollArea) -> None:
+        """Cap each box at its own need or more, and open the dialog wide
+        enough to show every column without scrolling sideways."""
+        self.ensurePolished()
+        for box in self.section_boxes.values():
+            box.setMaximumWidth(max(self._BOX_MAX_WIDTH, box.minimumSizeHint().width()))
+        margins = self.layout().contentsMargins()
+        needed = (container.minimumSizeHint().width() + 2 * scroll.frameWidth()
+                  + scroll.verticalScrollBar().sizeHint().width()
+                  + margins.left() + margins.right())
+        self.resize(max(self._OPEN_SIZE[0], needed), self._OPEN_SIZE[1])
+
+    @classmethod
+    def _name_label(cls, key: str) -> QLabel:
+        label = QLabel(key)
+        fm = label.fontMetrics()
+        if fm.horizontalAdvance(key) > cls._NAME_WIDTH:
+            # Explicit line breaks, not word wrap: a word-wrapped label tells
+            # the form a narrow width and Qt then breaks and clips short names.
+            lines, line = [], ""
+            for part in re.split(r"(?<=_)", key):
+                if line and fm.horizontalAdvance(line + part) > cls._NAME_WIDTH:
+                    lines.append(line)
+                    line = part
+                else:
+                    line += part
+            lines.append(line)
+            label.setText("\n".join(lines))
+        return label
 
     def _set_row_enabled(self, section, key, enabled):
         """Enable/disable one settings row: the field widget AND its label, so
@@ -864,32 +953,36 @@ class SettingsEditorDialog(QDialog):
         return list(self.config[section].items())
 
     @staticmethod
-    def _build_comment_map(path: Path) -> Dict[Tuple[str, str], str]:
+    def _read_defaults(path: Path) -> str:
+        from meg_qc.plugins.registry import with_plugin_sections
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        return with_plugin_sections(text)
+
+    @staticmethod
+    def _build_comment_map(defaults_text: str) -> Dict[Tuple[str, str], str]:
         """
         Parse INI comments and map them to (section, key) tooltips.
-        Uses the package default INI where comments are preserved.
+        Uses the package defaults (and plugins' sections), where comments are preserved.
         """
         mapping: Dict[Tuple[str, str], str] = {}
         current_section = "DEFAULT"
         pending: List[str] = []
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.rstrip("\n")
-                    stripped = line.strip()
-                    if stripped.startswith("[") and stripped.endswith("]"):
-                        current_section = stripped[1:-1]
-                        pending = []
-                    elif stripped.startswith("#") or stripped.startswith(";"):
-                        txt = stripped.lstrip("#; ").strip()
-                        if txt:
-                            pending.append(txt)
-                    elif "=" in stripped and not stripped.startswith("#") and not stripped.startswith(";"):
-                        key = stripped.split("=", 1)[0].strip()
-                        mapping[(current_section, key)] = " ".join(pending).strip()
-                        pending = []
-        except Exception:
-            return {}
+        for line in defaults_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                current_section = stripped[1:-1]
+                pending = []
+            elif stripped.startswith("#") or stripped.startswith(";"):
+                txt = stripped.lstrip("#; ").strip()
+                if txt:
+                    pending.append(txt)
+            elif "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                mapping[(current_section, key)] = " ".join(pending).strip()
+                pending = []
         return mapping
 
     def _build_widget(self, section: str, key: str, raw: str) -> Tuple[QWidget, str]:
@@ -919,9 +1012,9 @@ class SettingsEditorDialog(QDialog):
             container.setProperty("ch_types_widgets", (chk_mag, chk_grad, chk_eeg))
             return container, "ch_types"
 
-        if sec_key in self._ENUM_OPTIONS:
+        if sec_key in self._enum_options:
             combo = QComboBox()
-            options = self._ENUM_OPTIONS[sec_key]
+            options = self._enum_options[sec_key]
             combo.addItems(options)
             if val in options:
                 combo.setCurrentText(val)
@@ -939,6 +1032,7 @@ class SettingsEditorDialog(QDialog):
             line.setPlaceholderText("empty")
             line.setMinimumWidth(145)
             line.setMaximumWidth(215)
+            line.setCursorPosition(0)
             return line, "text"
 
         if sec_key in self._INT_OR_FALSE_KEYS:
@@ -952,6 +1046,7 @@ class SettingsEditorDialog(QDialog):
             spin.setMinimumWidth(100)
             spin.setMaximumWidth(170)
             spin.setSuffix(" Hz")
+            spin.setLocale(QLocale.c())
             is_disabled = val.strip().lower() in ("false", "0", "no", "none", "")
             if is_disabled:
                 chk.setChecked(False)
@@ -975,6 +1070,7 @@ class SettingsEditorDialog(QDialog):
             line.setPlaceholderText("empty")
             line.setMinimumWidth(145)
             line.setMaximumWidth(215)
+            line.setCursorPosition(0)
             return line, "text"
 
         # Force a decimal spin box for keys that represent a fractional quantity but
@@ -986,6 +1082,7 @@ class SettingsEditorDialog(QDialog):
                 spin = QSpinBox()
                 spin.setRange(-1_000_000_000, 1_000_000_000)
                 spin.setValue(ival)
+                spin.setLocale(QLocale.c())
                 spin.setMinimumWidth(145)
                 spin.setMaximumWidth(215)
                 return spin, "int"
@@ -997,6 +1094,9 @@ class SettingsEditorDialog(QDialog):
             dspin = QDoubleSpinBox()
             # Keep float editing concise and readable in the settings dialog.
             dspin.setDecimals(3)
+            # A decimal point whatever the system's region, as in settings.ini
+            # itself (a German or Spanish system showed 0,900).
+            dspin.setLocale(QLocale.c())
             dspin.setRange(-1_000_000_000.0, 1_000_000_000.0)
             dspin.setValue(fval)
             dspin.setMinimumWidth(145)
@@ -1008,6 +1108,8 @@ class SettingsEditorDialog(QDialog):
         line = QLineEdit(val)
         line.setMinimumWidth(145)
         line.setMaximumWidth(215)
+        # Show the start of a long value (a list of channels), not its end.
+        line.setCursorPosition(0)
         return line, "text"
 
     def _widget_to_value(self, widget: QWidget, widget_type: str) -> str:
@@ -1042,12 +1144,15 @@ class SettingsEditorDialog(QDialog):
             for key, _ in self._section_items(section):
                 widget, widget_type = self.widgets[(section, key)]
                 out[section][key] = self._widget_to_value(widget, widget_type)
+        for section, values in self._kept_sections.items():
+            if section not in out:
+                out[section] = values
         return out
 
     def _reset_to_defaults(self):
         cfg = configparser.ConfigParser()
         cfg.optionxform = str
-        cfg.read(self.defaults_path)
+        cfg.read_string(self._defaults_text)
         for (section, key), (widget, widget_type) in self.widgets.items():
             if section not in cfg or key not in cfg[section]:
                 continue
@@ -1088,6 +1193,7 @@ class SettingsEditorDialog(QDialog):
                     pass
             else:
                 widget.setText(str(val))
+                widget.setCursorPosition(0)
 
     def _save_as(self):
         target, _ = QFileDialog.getSaveFileName(
@@ -1366,6 +1472,7 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────── #
     def __init__(self):
         super().__init__()
+        _use_c_time_locale()
 
         self.setWindowTitle("MEEGqc")
         self.resize(700, 780)
@@ -1383,7 +1490,7 @@ class MainWindow(QMainWindow):
 
         # Persistent GUI preferences (theme etc.) are stored cross-platform
         # through QSettings backend (plist on macOS, registry on Windows, INI on Linux).
-        self.settings_store = QSettings("ANCP", "MEEGqc")
+        self.settings_store = settings_store("MEEGqc")
 
         self.themes = self._build_theme_dict()
         self.cpu_count, self.total_ram_gb = self._detect_system_resources()
@@ -1818,6 +1925,13 @@ class MainWindow(QMainWindow):
         total_gb = total_bytes / (1024**3) if total_bytes else 0.0
         return cpu_cnt, total_gb
 
+    def _open_plugins_dialog(self):
+        from meg_qc.miscellaneous.GUI.plugins_dialog import PluginsDialog
+        dialog = PluginsDialog(self, can_change=self._ensure_no_active_pipeline_task)
+        dialog.exec()
+        names = ", ".join(p.label for p in registry_plugins()) or "none"
+        self._log(f"Plugins installed: {names}")
+
     def _open_gui_settings_dialog(self):
         active_theme = str(self.settings_store.value("ui/theme", "Ocean"))
         dialog = GUISettingsDialog(
@@ -2060,6 +2174,20 @@ class MainWindow(QMainWindow):
         deriv_lay.addWidget(self.derivatives_dir)
         deriv_lay.addWidget(derivatives_browse)
         output_form.addRow("Derivatives output:", deriv_row)
+        self.output_layout = QComboBox()
+        self.output_layout.addItem("BIDS-style: <folder>/<dataset>/derivatives/MEEGqc", "bids")
+        self.output_layout.addItem("Literal: <folder>/MEEGqc (a folder per dataset when there are several)",
+                                   "literal")
+        self.output_layout.setToolTip(
+            "How results are laid out under the output folder. BIDS-style (the "
+            "default) mirrors the dataset as a BIDS derivatives tree; Literal "
+            "writes MEEGqc straight into the folder you chose. Only used when an "
+            "output folder is set: without one, results always go to the "
+            "dataset's own derivatives folder.")
+        self.output_layout.setEnabled(False)
+        self.derivatives_dir.textChanged.connect(
+            lambda text: self.output_layout.setEnabled(bool(text.strip())))
+        output_form.addRow("Layout:", self.output_layout)
         self.section_output = CollapsibleDetachableSection("Output folder (optional)", output_box, parent=w)
         lay.addWidget(self.section_output)
 
@@ -2080,38 +2208,41 @@ class MainWindow(QMainWindow):
         btn_info.setToolTip("Parallel jobs info")
 
         def show_jobs_info():
-            info = """
-            Number of parallel jobs to use during
-            processing.
-            Default is 1 (safe). Tick "All cores" (or
-            set -1) to use all available CPU cores.
-
-            ⚠️ Recommendation based on system
-            memory:
-
-            - 8 GB → up to 1 job
-            - 16 GB → up to 2 jobs
-            - 32 GB → up to 6 jobs
-            - 64 GB → up to 16 jobs
-            - 128 GB → up to 30 jobs
-
-            Using -1 will use all cores. Optimal RAM ≳ 3.5×
-            #cores.
-                    """
-            QMessageBox.information(self, "Jobs Recommendation", info)
+            levels = "\n".join(
+                f"- {lv.label}: up to {lv.mem_fraction:.0%} of the available "
+                f"RAM, keeps {lv.reserve_share * 100:g}% of total RAM free (at most "
+                f"{lv.reserve_cap_gb:g} GB), {lv.expansion:g}x the file size "
+                f"per recording"
+                for lv in GUARD_LEVELS.values())
+            info = (
+                "Number of recordings processed at the same time. Default is 1 "
+                "(safe). Tick \"All cores\" (or set -1) to use every CPU core.\n\n"
+                "Every recording being processed is held in memory, so the "
+                "memory guard may run fewer at once than you ask for. The log "
+                "says what it decided, for example \"n_jobs 4 reduced to 2 by "
+                "the memory guard\".\n\n"
+                f"Memory guard levels:\n{levels}\n\n"
+                "Editing any number makes the level Custom. Untick the memory "
+                "guard to run exactly n_jobs recordings at once, whatever the "
+                "memory."
+            )
+            QMessageBox.information(self, "Parallel recordings", info)
 
         btn_info.clicked.connect(show_jobs_info)
         row_jobs = QWidget()
         jobs_lay = QHBoxLayout(row_jobs)
         jobs_lay.setContentsMargins(0, 0, 0, 0)
         self.btn_reset_jobs = QPushButton("Reset defaults")
-        self.btn_reset_jobs.setToolTip("Reset calculation and plotting jobs to the safe default (1 core).")
+        self.btn_reset_jobs.setToolTip(
+            "Reset calculation and plotting jobs to the safe default (1 core) "
+            "and the memory guard to on, Balanced.")
         self.btn_reset_jobs.clicked.connect(self._reset_parallel_defaults)
         jobs_lay.addWidget(self.jobs)
         jobs_lay.addWidget(self.chk_all_cores)
         jobs_lay.addWidget(btn_info)
         jobs_lay.addWidget(self.btn_reset_jobs)
         calc_form.addRow("Calculation n_jobs:", row_jobs)
+        calc_form.addRow("Memory guard:", self._build_memory_guard_row())
 
         self.chk_calc_per_dataset_jobs = QCheckBox("Use per-dataset n_jobs override")
         self.chk_calc_per_dataset_jobs.toggled.connect(self._toggle_calc_jobs_table)
@@ -2343,6 +2474,12 @@ class MainWindow(QMainWindow):
         bottom_lay.addWidget(self.btn_check_updates)
         bottom_lay.addWidget(self.btn_version_notes)
         bottom_lay.addStretch(1)
+        self.btn_plugins = QPushButton("Plugins")
+        self.btn_plugins.setToolTip(
+            "See, install and remove plugins: optional features such as MEGnet "
+            "(ECG/EOG references for MEG recordings).")
+        self.btn_plugins.clicked.connect(self._open_plugins_dialog)
+        bottom_lay.addWidget(self.btn_plugins)
         self.btn_qc_viewer = QPushButton("QC Viewer")
         self.btn_qc_viewer.setToolTip("Open the integrated QC data & report viewer.")
         self.btn_qc_viewer.clicked.connect(self._open_qc_viewer)
@@ -2654,10 +2791,15 @@ class MainWindow(QMainWindow):
     def _discover_profiles_for_datasets(self) -> Tuple[Dict[str, List[str]], List[str]]:
         datasets = self._collect_dataset_paths()
         derivatives_base = self.derivatives_dir.text().strip() or None
+        layout = self._output_layout()
         profile_map: Dict[str, List[str]] = {}
         for ds in datasets:
             try:
-                profile_map[ds] = list_analysis_profiles(dataset_path=ds, external_derivatives_root=derivatives_base)
+                profile_map[ds] = list_analysis_profiles(
+                    dataset_path=ds,
+                    external_derivatives_root=dataset_derivatives_output(
+                        derivatives_base, ds, layout, multiple_datasets=len(datasets) > 1),
+                    output_layout=layout)
             except Exception:
                 profile_map[ds] = []
         common: List[str] = []
@@ -2750,6 +2892,197 @@ class MainWindow(QMainWindow):
         chk.toggled.connect(_toggle)
         return chk
 
+    # ── memory guard ────────────────────────────────────────────────────────
+    #: The level shown when the three numbers match no named level.
+    _GUARD_CUSTOM = "custom"
+
+    def _build_memory_guard_row(self) -> QWidget:
+        """The memory guard controls shown under "Calculation n_jobs".
+
+        A switch, a level (the named levels of ``resource_budget.GUARD_LEVELS``
+        plus Custom) and the three numbers a level stands for. Picking a level
+        fills in the numbers for THIS machine (the reserve scales with its
+        RAM); editing a number shows the level those numbers match, or Custom.
+        A status line says how much memory the current numbers leave for
+        recordings right now.
+        """
+        box = QWidget()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        self.chk_mem_guard = QCheckBox("Limit parallel recordings to what fits in memory")
+        self.chk_mem_guard.setChecked(True)
+        self.chk_mem_guard.setToolTip(
+            "When on, a run may process fewer recordings at once than n_jobs, "
+            "so they all fit in RAM; the log says how many it allowed. When "
+            "off, n_jobs recordings always run at once, which can run out of "
+            "memory on large recordings. Only matters when n_jobs is above 1.")
+
+        self.mem_level = QComboBox()
+        for key, lv in GUARD_LEVELS.items():
+            self.mem_level.addItem(lv.label, key)
+        self.mem_level.addItem("Custom", self._GUARD_CUSTOM)
+        self.mem_level.setToolTip(
+            "How permissive the guard is. Cautious runs fewer recordings at "
+            "once, Permissive more. Each level sets the three numbers below "
+            "for this computer; editing a number makes it Custom.")
+
+        self.mem_fraction = QSpinBox()
+        self.mem_fraction.setRange(5, 100)
+        self.mem_fraction.setSingleStep(5)
+        self.mem_fraction.setSuffix(" % of available RAM")
+        self.mem_fraction.setToolTip(
+            "The share of the memory available when the run starts that "
+            "recordings may use together. Higher runs more at once.")
+
+        self.mem_reserve = QDoubleSpinBox()
+        self.mem_reserve.setRange(0.0, 4096.0)
+        self.mem_reserve.setDecimals(1)
+        self.mem_reserve.setSingleStep(0.5)
+        self.mem_reserve.setSuffix(" GB")
+        self.mem_reserve.setToolTip(
+            "Memory never given to recordings, left for the system and other "
+            "programs. Taken off the available memory before the share above "
+            "is applied. Lower runs more at once.")
+
+        self.mem_expansion = QDoubleSpinBox()
+        self.mem_expansion.setRange(1.0, 20.0)
+        self.mem_expansion.setDecimals(1)
+        self.mem_expansion.setSingleStep(0.5)
+        self.mem_expansion.setSuffix(" × its file size")
+        self.mem_expansion.setToolTip(
+            "How much memory one recording is assumed to need while it is "
+            "processed, as a multiple of its size on disk (MEG FIF was "
+            "measured at about 4x; small recordings need relatively more). "
+            "Lower runs more at once.")
+
+        # A decimal point whatever the system's region, as in the run's log
+        # ("reserve 4.0 GB"), so the two never read differently.
+        for spin in (self.mem_reserve, self.mem_expansion):
+            spin.setLocale(QLocale.c())
+
+        self.mem_status = QLabel()
+        self.mem_status.setWordWrap(True)
+
+        self._mem_labels = [QLabel("Level:"), QLabel("Use up to:"),
+                            QLabel("Always keep free:"),
+                            QLabel("Each recording needs:")]
+        grid.addWidget(self.chk_mem_guard, 0, 0, 1, 3)
+        for row, (label, field) in enumerate(zip(
+                self._mem_labels,
+                (self.mem_level, self.mem_fraction, self.mem_reserve,
+                 self.mem_expansion)), start=1):
+            label.setToolTip(field.toolTip())
+            grid.addWidget(label, row, 0)
+            grid.addWidget(field, row, 1)
+        grid.addWidget(self.mem_status, 5, 0, 1, 3)
+        grid.setColumnStretch(2, 1)
+
+        self._mem_filling = False
+        self._apply_mem_level(DEFAULT_GUARD_LEVEL)
+        self.chk_mem_guard.toggled.connect(self._on_mem_guard_toggled)
+        self.mem_level.currentIndexChanged.connect(self._on_mem_level_changed)
+        for spin in (self.mem_fraction, self.mem_reserve, self.mem_expansion):
+            spin.valueChanged.connect(self._on_mem_number_changed)
+
+        # Available memory changes while the window is open.
+        self._mem_status_timer = QTimer(box)
+        self._mem_status_timer.setInterval(5000)
+        self._mem_status_timer.timeout.connect(self._refresh_mem_status)
+        self._mem_status_timer.start()
+        self._refresh_mem_status()
+        return box
+
+    def _apply_mem_level(self, level: str) -> None:
+        """Show ``level`` and, unless Custom, its numbers on this machine."""
+        self._mem_filling = True
+        try:
+            self.mem_level.setCurrentIndex(self.mem_level.findData(level))
+            if level != self._GUARD_CUSTOM:
+                fraction, reserve, expansion = level_values(level)
+                self.mem_fraction.setValue(int(round(fraction * 100)))
+                self.mem_reserve.setValue(reserve)
+                self.mem_expansion.setValue(expansion)
+        finally:
+            self._mem_filling = False
+
+    def _matching_mem_level(self) -> str:
+        """The named level whose numbers are the ones shown, else Custom."""
+        total = memory_total_bytes()
+        for key in GUARD_LEVELS:
+            fraction, reserve, expansion = level_values(key, total)
+            if (self.mem_fraction.value() == int(round(fraction * 100))
+                    and abs(self.mem_reserve.value() - reserve) < 0.05
+                    and abs(self.mem_expansion.value() - expansion) < 0.05):
+                return key
+        return self._GUARD_CUSTOM
+
+    def _on_mem_level_changed(self, _index: int) -> None:
+        if self._mem_filling:
+            return
+        self._apply_mem_level(self.mem_level.currentData())
+        self._refresh_mem_status()
+        self._persist_parallel_options()
+
+    def _on_mem_number_changed(self, _value) -> None:
+        if self._mem_filling:
+            return
+        self._mem_filling = True
+        try:
+            self.mem_level.setCurrentIndex(
+                self.mem_level.findData(self._matching_mem_level()))
+        finally:
+            self._mem_filling = False
+        self._refresh_mem_status()
+        self._persist_parallel_options()
+
+    def _on_mem_guard_toggled(self, checked: bool) -> None:
+        for widget in (self.mem_level, self.mem_fraction, self.mem_reserve,
+                       self.mem_expansion, *self._mem_labels):
+            widget.setEnabled(checked)
+        self._refresh_mem_status()
+        self._persist_parallel_options()
+
+    def _refresh_mem_status(self) -> None:
+        """Say how much memory the current settings leave for recordings."""
+        if not self.chk_mem_guard.isChecked():
+            self.mem_status.setText(
+                "Off: n_jobs recordings run at once, whatever the memory.")
+            return
+        reserve = self.mem_reserve.value()
+        avail, usable = usable_bytes(
+            mem_fraction=self.mem_fraction.value() / 100.0,
+            mem_reserve_gb=reserve)
+        if avail is None:
+            self.mem_status.setText(
+                "The available memory cannot be measured on this computer, so "
+                "the guard will not limit anything.")
+            return
+        gb = 1024 ** 3
+        if usable <= 0:
+            self.mem_status.setText(
+                f"Now: {avail / gb:.1f} GB available, no more than the "
+                f"{reserve:.1f} GB kept free, so one recording at a time.")
+        else:
+            self.mem_status.setText(
+                f"Now: {avail / gb:.1f} GB available, so up to "
+                f"{usable / gb:.1f} GB for recordings at once.")
+
+    def _output_layout(self) -> str:
+        """The chosen output layout; "bids" whenever no output folder is set."""
+        if not self.derivatives_dir.text().strip():
+            return "bids"
+        return str(self.output_layout.currentData() or "bids")
+
+    def _memory_guard_kwargs(self) -> Dict[str, Any]:
+        """The memory guard settings as keyword arguments of the dispatchers."""
+        return {
+            "memory_guard": self.chk_mem_guard.isChecked(),
+            "mem_fraction": self.mem_fraction.value() / 100.0,
+            "mem_reserve_gb": float(self.mem_reserve.value()),
+            "assume_expansion": float(self.mem_expansion.value()),
+        }
+
     def _persist_parallel_options(self):
         """Save the calculation/plotting parallel settings to QSettings so they
         survive GUI restarts. Stores the effective spinbox value (-1 when All
@@ -2761,6 +3094,13 @@ class MainWindow(QMainWindow):
         s.setValue("run/calc_all_cores", bool(self.chk_all_cores.isChecked()))
         s.setValue("run/plot_jobs", int(self.plot_jobs.value()))
         s.setValue("run/plot_all_cores", bool(self.chk_plot_all_cores.isChecked()))
+        # Memory guard. The numbers are stored for Custom; a named level is
+        # recomputed on the next start, so its reserve follows this machine.
+        s.setValue("run/mem_guard", bool(self.chk_mem_guard.isChecked()))
+        s.setValue("run/mem_level", str(self.mem_level.currentData()))
+        s.setValue("run/mem_fraction_pct", int(self.mem_fraction.value()))
+        s.setValue("run/mem_reserve_gb", float(self.mem_reserve.value()))
+        s.setValue("run/mem_expansion", float(self.mem_expansion.value()))
 
     def _restore_parallel_options(self):
         """Restore saved parallel settings, then wire change-persistence."""
@@ -2779,6 +3119,20 @@ class MainWindow(QMainWindow):
                 else:
                     chk.setChecked(False)
                     spin.setValue(val if val >= 1 else 1)
+            self.chk_mem_guard.setChecked(bool(s.value("run/mem_guard", True, type=bool)))
+            level = str(s.value("run/mem_level", DEFAULT_GUARD_LEVEL))
+            if level == self._GUARD_CUSTOM:
+                self._mem_filling = True
+                try:
+                    self.mem_fraction.setValue(int(s.value("run/mem_fraction_pct", 50, type=int)))
+                    self.mem_reserve.setValue(float(s.value("run/mem_reserve_gb", 4.0, type=float)))
+                    self.mem_expansion.setValue(float(s.value("run/mem_expansion", 4.0, type=float)))
+                finally:
+                    self._mem_filling = False
+                self._apply_mem_level(self._GUARD_CUSTOM)
+            else:
+                self._apply_mem_level(level if level in GUARD_LEVELS else DEFAULT_GUARD_LEVEL)
+            self._refresh_mem_status()
         finally:
             self._loading_parallel = False
         # Persist on any later change.
@@ -2788,11 +3142,15 @@ class MainWindow(QMainWindow):
         self.chk_plot_all_cores.toggled.connect(lambda _: self._persist_parallel_options())
 
     def _reset_parallel_defaults(self):
-        """Restore the safe default: 1 core for calculation and plotting."""
+        """Restore the safe defaults: 1 core for calculation and plotting, and
+        the memory guard on at the default level."""
         self.chk_all_cores.setChecked(False)
         self.jobs.setValue(1)
         self.chk_plot_all_cores.setChecked(False)
         self.plot_jobs.setValue(1)
+        self.chk_mem_guard.setChecked(True)
+        self._apply_mem_level(DEFAULT_GUARD_LEVEL)
+        self._refresh_mem_status()
         self._refresh_calc_jobs_table()
         self._persist_parallel_options()
 
@@ -3002,7 +3360,8 @@ class MainWindow(QMainWindow):
             self.global_config_path, dataset_cfg_overrides,
             analysis_mode, analysis_id, cfg_policy, sub_policy, False, False,
         )
-        worker = Worker(run_calculation_dispatch, *args)
+        worker = Worker(run_calculation_dispatch, *args, output_layout=self._output_layout(),
+                        **self._memory_guard_kwargs())
         self._set_active_run_task("calc")
 
         def on_started():
@@ -3058,7 +3417,11 @@ class MainWindow(QMainWindow):
             has_only_legacy_derivatives,
             LEGACY_DERIVATIVES_HINT,
         )
-        legacy_only = [d for d in dataset_paths if has_only_legacy_derivatives(d, derivatives_dir)]
+        layout = self._output_layout()
+        legacy_only = [d for d in dataset_paths if has_only_legacy_derivatives(
+            d, dataset_derivatives_output(derivatives_dir, d, layout,
+                                          multiple_datasets=len(dataset_paths) > 1),
+            output_layout=layout)]
         if legacy_only:
             QMessageBox.warning(
                 self,
@@ -3080,7 +3443,7 @@ class MainWindow(QMainWindow):
         if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=_cfg_policy, sub_policy=_sub_policy):
             return
         if analysis_mode == "new-profile" and not analysis_id:
-            QMessageBox.warning(self, "Plotting", "Mode 'new' requires a profile ID for plotting.\nUse mode 'reuse' with a profile ID, or 'latest'/'legacy'.")
+            QMessageBox.warning(self, "Plotting", _NEW_PROFILE_NEEDS_ID.format(action="plotting"))
             return
         if not self._validate_multi_dataset_profile_compatibility(analysis_mode, analysis_id, qa_multi_dataset=qa_multi_dataset, qc_multi_dataset=qc_multi_dataset):
             return
@@ -3099,7 +3462,7 @@ class MainWindow(QMainWindow):
             qa_subject, qa_dataset, qa_multi_dataset, qc_dataset, qc_multi_dataset,
             False, False, False, analysis_mode, analysis_id,
         )
-        worker = Worker(run_plotting_dispatch, *args)
+        worker = Worker(run_plotting_dispatch, *args, output_layout=self._output_layout())
         self._set_active_run_task("plot")
 
         def on_started():
@@ -3153,13 +3516,13 @@ class MainWindow(QMainWindow):
         if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=_cfg_policy, sub_policy=_sub_policy):
             return
         if analysis_mode == "new-profile" and not analysis_id:
-            QMessageBox.warning(self, "GQI", "Mode 'new' requires a profile ID for GQI recomputation.\nUse mode 'reuse' with a profile ID, or 'latest'/'legacy'.")
+            QMessageBox.warning(self, "GQI", _NEW_PROFILE_NEEDS_ID.format(action="recomputing the GQI"))
             return
         args = (
             dataset_paths, str(self.default_settings_path), derivatives_dir,
             self.global_config_path, dataset_cfg_overrides, analysis_mode, analysis_id,
         )
-        worker = Worker(run_gqi_dispatch, *args)
+        worker = Worker(run_gqi_dispatch, *args, output_layout=self._output_layout())
         self._set_active_run_task("gqi")
 
         def on_started():
@@ -3237,7 +3600,8 @@ class MainWindow(QMainWindow):
             qa_subject, qa_dataset, qa_multi_dataset, qc_dataset, qc_multi_dataset,
             False, False, not requested_any_scope,
         )
-        worker = Worker(run_all_dispatch, *args)
+        worker = Worker(run_all_dispatch, *args, output_layout=self._output_layout(),
+                        **self._memory_guard_kwargs())
         self._set_active_run_task("all")
 
         def on_started():
@@ -3385,6 +3749,7 @@ def run_megqc_gui():
     _ensure_xcb_cursor()  # no-op on non-Linux; auto-fixes missing libxcb-cursor0
     from PyQt6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication(sys.argv)
+    _use_c_time_locale()
     # Application-wide window icon: every QMainWindow / QDialog that does
     # not explicitly setWindowIcon() inherits this. Covers the QC Viewer,
     # the Live Terminal, the Settings dialogs, and any future sub-window.

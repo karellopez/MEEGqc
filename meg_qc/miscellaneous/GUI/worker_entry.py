@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import traceback
-from typing import Any, List
+from typing import Any, Dict, List, Tuple
 
 
 def _configure_utf8_stdio() -> None:
@@ -58,21 +58,21 @@ def _become_session_leader() -> None:
         pass
 
 
-def _decode_args(payload: str) -> List[Any]:
-    """Deserialize the JSON payload passed from the GUI."""
+def _decode_args(payload: str) -> Tuple[List[Any], Dict[str, Any]]:
+    """Deserialize the GUI's ``{"args": [...], "kwargs": {...}}`` payload."""
 
     data = json.loads(payload)
-    if isinstance(data, list):
-        return data
-    # Accept any scalar for robustness and treat it as a single argument.
-    return [data]
+    if not isinstance(data, dict):
+        raise ValueError("payload must be a JSON object with 'args' and 'kwargs'")
+    return list(data.get("args", [])), dict(data.get("kwargs", {}))
 
 
 def main() -> int:
     _configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="MEEGqc GUI worker entry point")
     parser.add_argument("--func", required=True, help="module:function path to invoke")
-    parser.add_argument("--args", required=True, help="JSON-encoded positional arguments")
+    parser.add_argument("--args", required=True,
+                        help='JSON object {"args": [...], "kwargs": {...}}')
     ns = parser.parse_args()
 
     _become_session_leader()
@@ -92,13 +92,13 @@ def main() -> int:
         return 3
 
     try:
-        args = _decode_args(ns.args)
-    except json.JSONDecodeError as exc:
+        args, kwargs = _decode_args(ns.args)
+    except (json.JSONDecodeError, ValueError) as exc:
         print(f"Invalid argument payload: {exc}", file=sys.stderr)
         return 4
 
     try:
-        func(*args)
+        func(*args, **kwargs)
     except Exception:  # noqa: BLE001 - propagate stack trace to stderr
         traceback.print_exc()
         return 5

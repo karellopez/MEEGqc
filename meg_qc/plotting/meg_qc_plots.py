@@ -22,6 +22,15 @@ from contextlib import contextmanager
 import shutil
 
 import plotly.graph_objects as go
+from meg_qc.plotting.reference_sources import (
+    plugin_source_of_name,
+    plugin_source_of_value,
+    plugin_sources_in,
+    source_label,
+)
+from meg_qc.plotting.style_controls import (
+    attach_distribution_style_controls as _attach_distribution_style_controls,
+)
 from plotly.utils import PlotlyJSONEncoder
 from plotly.offline import get_plotlyjs
 import mne
@@ -791,100 +800,6 @@ def _has_xy_or_scene_axes(fig: go.Figure) -> bool:
     return False
 
 
-def _attach_distribution_style_controls(
-    fig: go.Figure,
-    *,
-    default_line_width: float = 2.0,
-    default_marker_size: float = 8.0,
-) -> None:
-    """Attach numeric line/dot style controls when relevant traces are present."""
-    if fig is None or not getattr(fig, "data", None):
-        return
-
-    marker_level_to_size = {1: 3.0, 2: 4.0, 3: 5.5, 4: 7.0, 5: 8.5, 6: 10.0, 7: 12.0, 8: 14.0}
-
-    has_line_traces = False
-    has_marker_traces = False
-    for tr in fig.data:
-        t = str(getattr(tr, "type", "") or "").lower()
-        mode = str(getattr(tr, "mode", "") or "").lower()
-        if t in {"scatter", "scattergl"} and "lines" in mode:
-            has_line_traces = True
-        elif t in {"violin", "box", "histogram", "bar"}:
-            has_line_traces = True
-        if t in {"scatter", "scattergl"} and "markers" in mode:
-            has_marker_traces = True
-
-    if (not has_line_traces) and (not has_marker_traces):
-        return
-
-    def _line_restyle(level: int) -> Dict[str, List[Optional[float]]]:
-        line_width: List[Optional[float]] = []
-        marker_line_width: List[Optional[float]] = []
-        lw = float(level)
-        for tr in fig.data:
-            t = str(getattr(tr, "type", "") or "").lower()
-            mode = str(getattr(tr, "mode", "") or "").lower()
-            if (t in {"scatter", "scattergl"} and "lines" in mode) or (t in {"violin", "box", "histogram", "bar"}):
-                line_width.append(lw)
-            else:
-                line_width.append(None)
-
-            if t == "histogram":
-                marker_line_width.append(max(0.5, lw * 0.6))
-            elif t in {"scatter", "scattergl"} and "markers" in mode:
-                marker_line_width.append(max(0.25, lw * 0.2))
-            else:
-                marker_line_width.append(None)
-        return {"line.width": line_width, "marker.line.width": marker_line_width}
-
-    def _marker_restyle(level: int) -> Dict[str, List[Optional[float]]]:
-        size = float(marker_level_to_size.get(level, default_marker_size))
-        marker_size: List[Optional[float]] = []
-        for tr in fig.data:
-            t = str(getattr(tr, "type", "") or "").lower()
-            mode = str(getattr(tr, "mode", "") or "").lower()
-            if t in {"scatter", "scattergl"} and "markers" in mode:
-                marker_size.append(size)
-            else:
-                marker_size.append(None)
-        return {"marker.size": marker_size}
-
-    levels = list(range(1, 9))
-    line_active = max(0, min(7, int(round(default_line_width)) - 1))
-    marker_active_guess = min(levels, key=lambda lv: abs(float(marker_level_to_size[lv]) - float(default_marker_size)))
-    marker_active = max(0, min(7, int(marker_active_guess) - 1))
-
-    existing = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
-    menu_names = {str(getattr(m, "name", "") or "") for m in existing}
-
-    if has_line_traces and ("Line thickness level" not in menu_names):
-        existing.append(
-            dict(
-                name="Line thickness level",
-                type="buttons",
-                direction="right",
-                showactive=True,
-                active=line_active,
-                buttons=[dict(label=str(level), method="restyle", args=[_line_restyle(level)]) for level in levels],
-            )
-        )
-    if has_marker_traces and ("Dot size level" not in menu_names):
-        existing.append(
-            dict(
-                name="Dot size level",
-                type="buttons",
-                direction="right",
-                showactive=True,
-                active=marker_active,
-                buttons=[dict(label=str(level), method="restyle", args=[_marker_restyle(level)]) for level in levels],
-            )
-        )
-
-    if existing:
-        fig.update_layout(updatemenus=existing)
-
-
 def _attach_axis_label_size_controller(fig: go.Figure) -> None:
     """Attach numeric axis-label/ticks-size controller when axes are available."""
     if fig is None:
@@ -1166,40 +1081,42 @@ def _plot_block_from_derivative(deriv: QC_derivative, *, display_title: Optional
     )
 
 
+def _infer_metric_source(deriv) -> str:
+    """"MEGqc" for a figure of the calculation's own results, else the name of
+    the plugin whose reference it shows (set when the figure was built)."""
+    return getattr(deriv, "reference_label", None) or _infer_metric_source_from_path(deriv.name)
+
+
 def _infer_metric_source_from_path(path: str) -> str:
-    """Infer whether a metric artifact belongs to MEGqc or MEGnet."""
-    return "MEGnet" if "megnet" in str(path or "").lower() else "MEGqc"
+    """"MEGqc" for the calculation's own files, else the plugin's name
+    ("MEGnet" for ..._desc-ECGsmegnet_...)."""
+    source = plugin_source_of_name(path)
+    return source_label(source, path if os.path.isfile(str(path)) else None) if source else "MEGqc"
 
 
 def _infer_metric_source_from_tsv(path: str) -> str:
     """Infer source from TSV content when filename/entity parsing is unreliable."""
-    path_str = str(path or "")
-    if "megnet" in path_str.lower():
-        return "MEGnet"
+    source = plugin_source_of_name(path)
+    if source:
+        return source_label(source, path)
     try:
-        df = pd.read_csv(path_str, sep="\t", nrows=3)
+        df = pd.read_csv(str(path or ""), sep="\t", nrows=1)
     except Exception:
         return "MEGqc"
-
-    text_bits: List[str] = []
-    for col in ("signal_source", "recorded_or_reconstructed", "synthetic_component_ids", "synthetic_component_probs"):
-        if col in df.columns:
-            vals = [str(v) for v in df[col].dropna().tolist()[:3]]
-            text_bits.extend(vals)
-    joined = " ".join(text_bits).lower()
-    if "megnet" in joined:
-        return "MEGnet"
-    if "synthetic" in joined:
-        return "MEGnet"
+    for col in ("signal_source", "recorded_or_reconstructed"):
+        if col in df.columns and len(df):
+            source = plugin_source_of_value(df[col].iloc[0])
+            if source:
+                return source_label(source, path)
     return "MEGqc"
 
 
-def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[str]) -> str:
-    """Render MEGnet channel/reference metadata extracted from TSV artifacts."""
+def _build_reference_info_html(metric_key: str, source_paths: Sequence[str], source: str) -> str:
+    """Render a plugin reference's channel metadata from its reference table."""
+    want = f"{str(metric_key).lower()[:-1]}channel{source}"
     candidate_paths = [
         str(p) for p in source_paths
-        if "megnet" in str(p).lower()
-        and f"{str(metric_key).lower()[:-1]}channelmegnet" in os.path.basename(str(p)).lower()
+        if plugin_source_of_name(p) == source and f"desc-{want}" in os.path.basename(str(p)).lower()
     ]
     if not candidate_paths:
         return ""
@@ -1219,13 +1136,12 @@ def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[st
         if not first_row:
             continue
 
-        channel_col = next(
-            (col for col in first_row.keys() if str(col).lower().startswith(("ecg", "eog"))),
-            "",
-        )
+        # The reference table's first column is the reference itself, named
+        # after it (MEGnet_ECG): show that name, not its first sample.
+        channel_col = next(iter(first_row.keys()), "")
         info_pairs = [
-            ("Reference channel", first_row.get(channel_col, channel_col or "-")),
-            ("Source", first_row.get("signal_source") or first_row.get("recorded_or_reconstructed") or "megnet"),
+            ("Reference channel", channel_col or "-"),
+            ("Source", first_row.get("signal_source") or first_row.get("recorded_or_reconstructed") or source),
             ("Component IDs", first_row.get("synthetic_component_ids") or "-"),
             ("Component probabilities", first_row.get("synthetic_component_probs") or "-"),
             ("Detected events", first_row.get("n_events") or "-"),
@@ -1241,7 +1157,7 @@ def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[st
         )
         rows.append(
             "<div class='overview-card'>"
-            "<h4>MEGnet reference info</h4>"
+            f"<h4>{html.escape(source_label(source, path))} reference info</h4>"
             "<table>"
             "<thead><tr><th>Field</th><th>Value</th></tr></thead>"
             f"<tbody>{body}</tbody>"
@@ -1251,6 +1167,15 @@ def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[st
         )
 
     return "".join(rows)
+
+
+def _reference_info_for_group(metric_key: str, source_paths: Sequence[str], group_label: str) -> str:
+    """The reference-info card of the plugin shown under ``group_label``."""
+    for p in source_paths:
+        source = plugin_source_of_name(p)
+        if source and source_label(source, p if os.path.isfile(str(p)) else None) == group_label:
+            return _build_reference_info_html(metric_key, source_paths, source)
+    return ""
 
 
 def _build_channel_tabs_from_derivatives(
@@ -1294,7 +1219,7 @@ def _build_channel_tabs_from_derivatives(
     )
 
 
-def _augment_with_megnet_metric_files(
+def _augment_with_plugin_metric_files(
     *,
     metric: str,
     tsv_paths: List[str],
@@ -1302,11 +1227,11 @@ def _augment_with_megnet_metric_files(
     calculated_derivs_folder: str,
     query_base: Optional[str] = None,
 ) -> Tuple[List[str], List[dict]]:
-    """Augment ECG/EOG discovery with direct filesystem matches for MEGnet files.
+    """Augment ECG/EOG discovery with direct filesystem matches for plugin files.
 
     ANCPBIDS indexing is strict about entity formatting and may miss files whose
-    desc token uses a compound name (e.g. ``ECGsmegnet``). We therefore add those
-    files directly from disk for plotting/report assembly.
+    desc token uses a compound name (e.g. ``ECGsmegnet``, a plugin's reference).
+    We therefore add those files directly from disk for plotting/report assembly.
     """
     metric_l = str(metric).lower()
     if metric_l not in {"ecgs", "eogs"}:
@@ -1323,19 +1248,22 @@ def _augment_with_megnet_metric_files(
     calc_root = calc_root.resolve()
     if not calc_root.exists():
         return tsv_paths, entities_obj
-    existing_paths = {str(p) for p in tsv_paths}
+    # Real paths: on macOS /tmp is /private/tmp, so the same file found by the
+    # query and on disk was added twice and the report stopped with
+    # "Different number of tsvs and entities".
+    existing_paths = {os.path.realpath(str(p)) for p in tsv_paths}
     extra_pairs: List[Tuple[str, dict]] = []
 
     for path_obj in calc_root.rglob("*.tsv"):
         name_l = path_obj.name.lower()
-        if "megnet" not in name_l:
+        if plugin_source_of_name(path_obj.name) is None:
             continue
         if not any(tok in name_l for tok in metric_tokens):
             continue
         path_str = str(path_obj)
-        if path_str in existing_paths:
+        if os.path.realpath(path_str) in existing_paths:
             continue
-        existing_paths.add(path_str)
+        existing_paths.add(os.path.realpath(path_str))
         extra_pairs.append(
             (
                 path_str,
@@ -1464,11 +1392,10 @@ def _build_metric_run_panel(
         blocks.append(f"<details><summary>Machine-readable inputs</summary><ul>{src_items}</ul></details>")
 
     if derivatives:
-        # Group derivatives by metric source (MEGqc vs MEGnet)
+        # Group derivatives by metric source (MEGqc, or a plugin such as MEGnet)
         source_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
         for deriv in derivatives:
-            source_label = _infer_metric_source_from_path(deriv.name)
-            source_groups[source_label].append(deriv)
+            source_groups[_infer_metric_source(deriv)].append(deriv)
 
         def _build_deriv_channel_tabs(
             derivs: Sequence[QC_derivative],
@@ -1508,23 +1435,24 @@ def _build_metric_run_panel(
         if len(source_groups) > 1:
             # Multiple sources: wrap each source in a subtab
             source_tabs: List[Tuple[str, str]] = []
-            megnet_info_blocks = []
-            for source_label in ["MEGqc", "MEGnet"]:
-                derivs_for_source = source_groups.get(source_label, [])
+            reference_info_blocks = []
+            ordered = ["MEGqc"] + sorted(k for k in source_groups if k != "MEGqc")
+            for group_label in ordered:
+                derivs_for_source = source_groups.get(group_label, [])
                 if not derivs_for_source:
                     continue
                 source_tabs.append(
                     (
-                        source_label,
+                        group_label,
                         _build_deriv_channel_tabs(
                             derivs_for_source,
-                            group_prefix=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{source_label.lower()}",
+                            group_prefix=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{_sanitize_token(group_label.lower())}",
                         ),
                     )
                 )
-                if source_label == "MEGnet":
-                    megnet_info_blocks.append(
-                        _build_megnet_reference_info_html(metric_key, source_paths)
+                if group_label != "MEGqc":
+                    reference_info_blocks.append(
+                        _reference_info_for_group(metric_key, source_paths, group_label)
                     )
             if source_tabs:
                 blocks.append(
@@ -1534,7 +1462,7 @@ def _build_metric_run_panel(
                         level=3,
                     )
                 )
-            for info_block in megnet_info_blocks:
+            for info_block in reference_info_blocks:
                 if info_block:
                     blocks.append(info_block)
         else:
@@ -1547,10 +1475,10 @@ def _build_metric_run_panel(
                     group_prefix=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
                 )
             )
-            if single_source_label == "MEGnet":
-                megnet_info = _build_megnet_reference_info_html(metric_key, source_paths)
-                if megnet_info:
-                    blocks.append(megnet_info)
+            if single_source_label != "MEGqc":
+                reference_info = _reference_info_for_group(metric_key, source_paths, single_source_label)
+                if reference_info:
+                    blocks.append(reference_info)
     else:
         blocks.append("<p>No figures were generated for this metric/run combination.</p>")
 
@@ -2370,10 +2298,14 @@ _PLOT_SETTINGS_JS = """
         if (__psMaster && __psMaster['*']) { delete __psMaster['*']; }
       }
 
+      // A button's label without the spaces some figures pad it with to widen
+      // the button ("   3   "), so a choice made on one plot finds the same
+      // button on every other.
+      function __psLabel(x) { return String(x || '').trim(); }
       function __psFindButton(group, label) {
         var btns = (group && Array.isArray(group.buttons)) ? group.buttons : [];
         for (var i = 0; i < btns.length; i++) {
-          if (String((btns[i] && btns[i].label) || '') === label) return btns[i];
+          if (__psLabel(btns[i] && btns[i].label) === __psLabel(label)) return btns[i];
         }
         return null;
       }
@@ -2385,7 +2317,7 @@ _PLOT_SETTINGS_JS = """
           var t = gEl.querySelector('.plot-control-title');
           if (!t || t.textContent !== title) return;
           Array.prototype.forEach.call(gEl.querySelectorAll('.plot-control-btn'), function(b) {
-            if (b.textContent === label) b.classList.add('active'); else b.classList.remove('active');
+            if (__psLabel(b.textContent) === __psLabel(label)) b.classList.add('active'); else b.classList.remove('active');
           });
         });
       }
@@ -2486,7 +2418,7 @@ _PLOT_SETTINGS_JS = """
             if (!byTitle[title]) { byTitle[title] = []; order.push(title); }
             var seen = byTitle[title];
             (Array.isArray(g.buttons) ? g.buttons : []).forEach(function(b) {
-              var lab = String((b && b.label) || '');
+              var lab = __psLabel(b && b.label);
               if (lab && seen.indexOf(lab) === -1) seen.push(lab);
             });
           });
@@ -4012,6 +3944,11 @@ def make_plots_meg_qc(
     print('___MEGqc___: CHOSEN settings:', plot_settings)
     # --------------------------------------------------------------------------------
 
+    _calc_root = Path(calculated_derivs_folder)
+    if not _calc_root.is_absolute() and query_base:
+        _calc_root = Path(query_base) / _calc_root
+    plugin_sources = plugin_sources_in(_calc_root)
+
     try:
         # 2. Collect TSVs for each sub + metric
         tsvs_to_plot_by_metric = {}
@@ -4034,10 +3971,13 @@ def make_plots_meg_qc(
                 # generated correctly — cover MAG, GRAD, and EEG variants.
                 query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDnoiseEeg',
                                       'PSDwavesMag', 'PSDwavesGrad', 'PSDwavesEeg']
-            elif metric == 'ECGs':
-                query_args['desc'] = ['ECGchannel', 'ECGs', 'ECGchannelmegnet', 'ECGsmegnet']
-            elif metric == 'EOGs':
-                query_args['desc'] = ['EOGchannel', 'EOGs', 'EOGchannelmegnet', 'EOGsmegnet']
+            elif metric in ('ECGs', 'EOGs'):
+                # The calculation's reference and every plugin's (e.g. MEGnet's
+                # desc-ECGchannelmegnet / desc-ECGsmegnet) found on disk.
+                kind = metric[:3]
+                query_args['desc'] = [f'{kind}channel', f'{kind}s'] + [
+                    f'{kind}{part}{src}' for src in sorted(plugin_sources)
+                    for part in ('channel', 's')]
             else:
                 query_args['desc'] = [metric]
 
@@ -4047,8 +3987,8 @@ def make_plots_meg_qc(
 
             with temporary_dataset_base(query_dataset, query_base):
                 tsv_paths = list(query_dataset.query(**query_args))
-            # Augment with MEGnet files that ANCPBIDS may have missed
-            tsv_paths, entities_obj_augment = _augment_with_megnet_metric_files(
+            # Augment with plugin files that ANCPBIDS may have missed
+            tsv_paths, entities_obj_augment = _augment_with_plugin_metric_files(
                 metric=metric,
                 tsv_paths=tsv_paths,
                 entities_obj=[],

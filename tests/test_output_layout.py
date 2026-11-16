@@ -189,3 +189,15 @@ def test_bids_layout_keeps_existing_duplicate_name_behavior():
 def test_unknown_output_layout_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="Invalid output_layout"):
         resolve_output_roots(str(tmp_path / "dataset"), str(tmp_path), "flat")
+
+
+def test_computing_the_output_path_creates_nothing(tmp_path):
+    """The CLI's closing "Results are available under" message only computes
+    the path; resolve_output_roots, which creates folders, is for writing."""
+    from meg_qc.output_paths import output_roots, resolve_output_roots
+    ds, out = tmp_path / "ds", tmp_path / "out"
+    for layout in ("bids", "literal"):
+        _, root = output_roots(str(ds), str(out), output_layout=layout)
+        assert not out.exists() and not ds.exists()
+    _, root = resolve_output_roots(str(ds), str(out), output_layout="bids")
+    assert Path(root).is_dir()

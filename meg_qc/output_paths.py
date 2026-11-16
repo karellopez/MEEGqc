@@ -65,12 +65,12 @@ def dataset_derivatives_output(
     return derivatives_output
 
 
-def resolve_output_roots(
+def output_roots(
     dataset_path: str,
     external_derivatives_root: str | None,
     output_layout: str = "bids",
 ) -> tuple[str, str]:
-    """Return the output root and the folder that contains ``MEEGqc``.
+    """The output root and the folder that contains ``MEEGqc``, computed only.
 
     ``bids`` preserves the existing behavior. With an external output, it
     writes to ``<output>/<dataset>/derivatives/MEEGqc``.
@@ -78,6 +78,8 @@ def resolve_output_roots(
     ``literal`` treats the supplied output as the derivatives folder itself,
     so the result is ``<output>/MEEGqc``. Multi-dataset callers pass a
     dataset-specific output produced by :func:`dataset_derivatives_output`.
+
+    Creates nothing: use :func:`resolve_output_roots` before writing.
     """
     layout = normalize_output_layout(output_layout)
     if external_derivatives_root is None:
@@ -92,7 +94,19 @@ def resolve_output_roots(
     else:
         output_root = external_derivatives_root
         derivatives_root = output_root
+    return output_root, derivatives_root
 
+
+def resolve_output_roots(
+    dataset_path: str,
+    external_derivatives_root: str | None,
+    output_layout: str = "bids",
+) -> tuple[str, str]:
+    """:func:`output_roots`, with the folders created and, for an external
+    BIDS layout, a ``dataset_description.json`` written, ready for writing."""
+    layout = normalize_output_layout(output_layout)
+    output_root, derivatives_root = output_roots(
+        dataset_path, external_derivatives_root, layout)
     os.makedirs(derivatives_root, exist_ok=True)
 
     # External BIDS layout is loaded as a dataset during report generation.
