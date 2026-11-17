@@ -1354,6 +1354,9 @@ def _summary_distribution_dataset_cards_html(
         "<h3>Physiological noise</h3>"
         + _cards_for(metric_defs[3:])
         + "</div>"
+        # The same shared bar as every other summary grid, so these plots have
+        # controls and follow the report's Plot settings.
+        + _summary_shared_controls_panel_html(summary_group_id)
         + (
             "<div class='summary-shared-note'><strong>How to interpret:</strong> "
             "Each panel is one metric and <strong>one dot is one dataset</strong>: the mean over all of that "
@@ -2447,6 +2450,7 @@ def _build_multi_dataset_report_html(
             }});
           }});
           applySummaryState(groupId);
+          if (typeof __psRegisterSharedBar === 'function') {{ __psRegisterSharedBar(panel); }}
         }});
       }}
 

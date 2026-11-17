@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The installers are kept byte for byte, whatever a checkout's settings: the
+# Windows one runs as a batch file and needs its CRLF line endings, the others
+# run in bash and need LF. installers.zip is built from these exact bytes.
+installers/**/*.bat -text
+installers/**/*.sh text eol=lf
+installers/**/*.command text eol=lf

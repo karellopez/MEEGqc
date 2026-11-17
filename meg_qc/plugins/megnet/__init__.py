@@ -4,22 +4,24 @@ MEGnet (Treacher et al., NeuroImage 2021; package ``megnet-neuro``) labels the
 ICA components of a MEG recording as heartbeat, blink, eye movement or other.
 This plugin gives MEEGqc's ECG and EOG metrics those components as reference
 signals, for recordings without a usable ECG or EOG channel or to compare with
-one. Installed with ``meegqc-plugins install megnet`` or from MEEGqc's Plugins
-dialog; MEEGqc finds it through the ``meegqc.plugins`` entry point.
+one.
+
+It is part of MEEGqc, and the only plugin that is: its code ships with every
+MEEGqc and is loaded only once its dependencies are installed (``megnet-neuro``,
+which brings PyTorch and Keras), from MEEGqc's Plugins window, with
+``meegqc-plugins install megnet`` or with ``pip install meg_qc[megnet]``.
+Nothing imports MEGnet, Keras or PyTorch before a recording is analysed with it
+(``run.py`` does, inside ``compute``). The catalog entry
+(``meg_qc.plugins.catalog``) says where the plugin is and what it needs.
 """
 from __future__ import annotations
 
-from importlib import metadata, resources
+from importlib import resources
 from typing import Mapping, Optional
 
+from meg_qc import __version__
 from meg_qc.plugins.api import PLUGIN_API_VERSION, Plugin, ReferenceResult
-
-from meegqc_megnet.applies import SYSTEMS, why_not
-
-try:
-    __version__ = metadata.version("meegqc-megnet")
-except metadata.PackageNotFoundError:
-    __version__ = "0.0.0"
+from meg_qc.plugins.megnet.applies import SYSTEMS, why_not
 
 
 def _bool(value) -> bool:
@@ -54,12 +56,12 @@ class MegnetProvider:
         return why_not(raw)
 
     def compute(self, raw, params: dict, *, data_path: str, work_dir: str) -> ReferenceResult:
-        from meegqc_megnet.run import compute
+        from meg_qc.plugins.megnet.run import compute
         return compute(raw, params, data_path=data_path, work_dir=work_dir)
 
 
 def plugin() -> Plugin:
-    """The entry point MEEGqc calls (group ``meegqc.plugins``, name ``megnet``)."""
+    """What the registry loads once ``megnet-neuro`` is installed."""
     return Plugin(
         name="megnet",
         label="MEGnet",
@@ -69,9 +71,9 @@ def plugin() -> Plugin:
                  "least 105 s long."),
         api_version=PLUGIN_API_VERSION,
         settings_section="MEGNET",
-        default_settings=resources.files("meegqc_megnet").joinpath("settings.ini")
+        default_settings=resources.files("meg_qc.plugins.megnet").joinpath("settings.ini")
         .read_text(encoding="utf-8"),
         parse_settings=parse_settings,
         reference_provider=MegnetProvider(),
-        homepage="https://github.com/ANCPLabOldenburg/MEEGqc/tree/main/plugins/meegqc-megnet",
+        homepage="https://github.com/ANCPLabOldenburg/MEEGqc/tree/main/meg_qc/plugins/megnet",
     )

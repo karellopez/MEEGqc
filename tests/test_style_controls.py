@@ -193,3 +193,77 @@ def test_plot_settings_matches_buttons_whatever_their_padding():
     assert "__psLabel(btns[i] && btns[i].label) === __psLabel(label)" in js
     assert "var lab = __psLabel(b && b.label);" in js
     assert "=== label) return btns[i]" not in js
+
+
+# ── every figure follows the report's Plot settings ───────────────────────
+#
+# The Plot settings panel reaches a figure only through the controls the
+# figure registers, and a summary grid only through its shared bar. Found
+# 2026-11-16: the dataset and QC reports' line plots (ECDFs, PSD and epoch
+# profiles) had no line-thickness control, the multi-dataset "Dataset means"
+# tabs had no controls at all, and no summary grid followed the panel.
+
+def _registered_titles(div_html: str) -> list:
+    import json
+    import re
+    from meg_qc.plotting import meg_qc_dataset_plots, meg_qc_dataset_qc_plots
+    pid = re.search(r"data-payload-id='([^']+)'", div_html).group(1)
+    store = (meg_qc_dataset_qc_plots._LAZY_PLOT_PAYLOADS if "qc" in pid
+             else meg_qc_dataset_plots._LAZY_PLOT_PAYLOADS)
+    payload = json.loads(store[pid].replace("<\\/", "</"))
+    return [g["title"] for g in payload["controls"]]
+
+
+def _ecdf(width: float = 3.0) -> go.Figure:
+    return go.Figure([go.Scatter(x=[0, 1, 2], y=[0, 0.5, 1], mode="lines", line={"width": width})])
+
+
+@pytest.mark.parametrize("module", ["meg_qc_dataset_plots", "meg_qc_dataset_qc_plots"])
+def test_a_line_plot_of_the_dataset_reports_gets_the_thickness_control(module):
+    import importlib
+    to_div = importlib.import_module(f"meg_qc.plotting.{module}")._figure_to_div
+    titles = _registered_titles(to_div(_ecdf()))
+    assert "Line thickness level" in titles
+    # A summary strip keeps none of its own: its grid's shared bar is its control.
+    assert _registered_titles(to_div(_ecdf(), include_axis_size_control=False,
+                                     include_plot_controls=False)) == []
+
+
+def test_the_highlighted_level_is_the_one_the_figure_is_drawn_at():
+    from meg_qc.plotting.style_controls import attach_matching_style_controls
+    fig = go.Figure([go.Scatter(x=[0, 1], y=[0, 1], mode="lines+markers",
+                                line={"width": 3.0}, marker={"size": 5.5})])
+    attach_matching_style_controls(fig)
+    menus = {m.name: m.active for m in fig.layout.updatemenus}
+    assert menus == {"Line thickness level": 2, "Dot size level": 2}   # levels 3 and 3
+
+
+def test_dataset_means_has_the_shared_bar_of_every_summary_grid():
+    from meg_qc.plotting.meg_qc_multi_dataset_plots import _summary_distribution_dataset_cards_html
+    from meg_qc.plotting.meg_qc_dataset_qc_plots import _summary_distribution_dataset_grid_html
+    df = pd.DataFrame({"sample_id": ["a", "b"], "std_mean": [1.0, 2.0], "ptp_mean": [3.0, 4.0]})
+    qa = _summary_distribution_dataset_cards_html(df, amplitude_unit="T", summary_group_id="g-qa")
+    assert "class='summary-dist-grid' data-summary-group='g-qa'" in qa
+    assert "class='summary-shared-controls' data-summary-group='g-qa'" in qa
+    import inspect
+    qc_source = inspect.getsource(_summary_distribution_dataset_grid_html)
+    assert "_summary_shared_controls_panel_html(summary_group_id)" in qc_source
+
+
+def test_every_shared_bar_takes_part_in_the_plot_settings():
+    """The panel lists the bars' controls (``__psSources``) and presses their
+    buttons; every report registers its bars when it binds them."""
+    import inspect
+    from meg_qc.plotting import (meg_qc_dataset_plots, meg_qc_dataset_qc_plots,
+                                 meg_qc_multi_dataset_plots)
+    from meg_qc.plotting.meg_qc_plots import _PLOT_SETTINGS_JS as js
+    assert "function __psRegisterSharedBar(bar)" in js
+    for name in ("__psTitleKinds", "__psKinds", "__psCollectUnique"):
+        body = js[js.index(f"function {name}("):]
+        body = body[:body.index("\n      }\n")]
+        assert "__psSources()" in body and "__psAllPayloads()" not in body, name
+    for module in (meg_qc_dataset_plots, meg_qc_dataset_qc_plots, meg_qc_multi_dataset_plots):
+        source = inspect.getsource(module)
+        bind = source[source.index("function bindSummarySharedControls"):]
+        bind = bind[:bind.index("function renderLazyInScope")]
+        assert "__psRegisterSharedBar(panel)" in bind, module.__name__

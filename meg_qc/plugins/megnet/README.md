@@ -17,7 +17,8 @@ From the MEEGqc GUI: **Plugins**, then **Install** next to MEGnet. Or:
 meegqc-plugins install megnet
 ```
 
-This installs `meegqc-megnet` and `megnet-neuro`, which bring PyTorch and Keras
+MEGnet's own code is part of MEEGqc; this installs the libraries it needs,
+`megnet-neuro` (also `pip install meg_qc[megnet]`), which brings PyTorch and Keras
 (about 1 GB). On Linux, pip installs the CUDA build of PyTorch (several GB)
 unless the CPU build is installed first:
 
@@ -65,7 +66,7 @@ MEGnet tab, with the components used.
 ## Tests
 
 ```bash
-pytest plugins/meegqc-megnet/tests     # needs neither MEGnet nor test data
+pytest tests/test_megnet_plugin_code.py     # needs neither MEGnet nor test data
 ```
 
 Real-data tests are in MEEGqc's suite (`tests/realdata/test_megnet_plugin.py`)

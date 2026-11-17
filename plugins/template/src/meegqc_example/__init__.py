@@ -1,7 +1,7 @@
 """A MEEGqc plugin template: a reference provider that finds nothing.
 
 Copy the folder, rename ``example`` everywhere, and replace ``compute``. The
-guidelines are in plugins/README.md; plugins/meegqc-megnet is a complete
+guidelines are in plugins/README.md; meg_qc/plugins/megnet (MEGnet) is a complete
 plugin.
 """
 from __future__ import annotations

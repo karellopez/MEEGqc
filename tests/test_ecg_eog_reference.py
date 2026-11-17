@@ -10,7 +10,7 @@ Each test pins a defect found in the 2026-11 review:
   independent reference (``desc-ECGchannelmegnet``), showing the wrong source.
 
 MEGnet's own settings and component choice are tested in its plugin
-(plugins/meegqc-megnet/tests).
+(tests/test_megnet_plugin_code.py).
 """
 from __future__ import annotations
 

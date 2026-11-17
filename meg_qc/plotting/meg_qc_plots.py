@@ -2336,7 +2336,8 @@ _PLOT_SETTINGS_JS = """
         for (var i = 0; i < groups.length; i++) {
           if (String((groups[i] && groups[i].title) || '') !== title) continue;
           var btn = __psFindButton(groups[i], label);
-          if (btn) { runPlotlyControlAction(entry.plotEl, btn); __psSyncPerPlot(entry.plotEl, title, label); }
+          if (btn && entry.apply) { entry.apply(title, label); }
+          else if (btn) { runPlotlyControlAction(entry.plotEl, btn); __psSyncPerPlot(entry.plotEl, title, label); }
           return;
         }
       }
@@ -2348,12 +2349,54 @@ _PLOT_SETTINGS_JS = """
         __psRegistry.push(entry);
         __psApplyEntryAll(entry);
       }
+      // A summary grid (the small strip plots of the summary distributions) is
+      // set by ONE shared bar, not a bar per plot. The bar takes part in the
+      // Plot settings as a figure does: its controls are among the panel's
+      // options, under its plot kind, and a choice made in the panel (or saved
+      // from an earlier visit) presses the bar's matching button, which
+      // restyles every plot of the grid.
+      function __psBarControls(bar) {
+        var groups = [];
+        Array.prototype.forEach.call(bar.querySelectorAll('.plot-control-group'), function(gEl) {
+          var t = gEl.querySelector('.plot-control-title');
+          var buttons = Array.prototype.map.call(gEl.querySelectorAll('.plot-control-btn'), function(b) {
+            return { label: __psLabel(b.textContent) };
+          });
+          if (t && buttons.length) groups.push({ title: String(t.textContent || ''), buttons: buttons });
+        });
+        return groups;
+      }
+      function __psSharedBars() {
+        return Array.prototype.map.call(document.querySelectorAll('.summary-shared-controls'), function(bar) {
+          return { kind: bar.dataset.kind || 'Distribution', controls: __psBarControls(bar) };
+        });
+      }
+      // Everything that can be set: the figures' payloads and the shared bars.
+      function __psSources() { return __psAllPayloads().concat(__psSharedBars()); }
+      function __psRegisterSharedBar(bar) {
+        if (!bar || bar.dataset.psRegistered === '1') return;
+        bar.dataset.psRegistered = '1';
+        var entry = {
+          plotEl: bar, groups: __psBarControls(bar), kind: bar.dataset.kind || 'Distribution',
+          apply: function(title, label) {
+            Array.prototype.forEach.call(bar.querySelectorAll('.plot-control-group'), function(gEl) {
+              var t = gEl.querySelector('.plot-control-title');
+              if (!t || t.textContent !== title) return;
+              Array.prototype.forEach.call(gEl.querySelectorAll('.plot-control-btn'), function(b) {
+                if (__psLabel(b.textContent) === __psLabel(label) && !b.classList.contains('active')) b.click();
+              });
+            });
+          }
+        };
+        __psRegistry.push(entry);
+        __psApplyEntryAll(entry);
+      }
       // Which plot kinds expose a control with a given title (read from the
       // payloads, so it covers plots that have not lazily rendered yet). Used to
       // fan the general scope out to every relevant kind and to annotate titles.
       function __psTitleKinds() {
         var map = {};
-        __psAllPayloads().forEach(function(p) {
+        __psSources().forEach(function(p) {
           var kind = p.kind || 'Other';
           (Array.isArray(p.controls) ? p.controls : []).forEach(function(g) {
             var t = String((g && g.title) || 'Control');
@@ -2401,7 +2444,7 @@ _PLOT_SETTINGS_JS = """
       // scope in the panel (a per-kind choice overrides the general one).
       function __psKinds() {
         var seen = {}; var order = [];
-        __psAllPayloads().forEach(function(p) {
+        __psSources().forEach(function(p) {
           var groups = Array.isArray(p.controls) ? p.controls : [];
           var k = p.kind || 'Other';
           if (groups.length && !seen[k]) { seen[k] = 1; order.push(k); }
@@ -2410,7 +2453,7 @@ _PLOT_SETTINGS_JS = """
       }
       function __psCollectUnique(scope) {
         var byTitle = {}; var order = [];
-        __psAllPayloads().forEach(function(p) {
+        __psSources().forEach(function(p) {
           var kind = p.kind || 'Other';
           if (scope !== '*' && kind !== scope) return;
           (Array.isArray(p.controls) ? p.controls : []).forEach(function(g) {

@@ -23,10 +23,14 @@ per-recording writing a subject can die after writing 40 of 50 recordings; a
 subject-level log would call that a total failure while 40 valid results sit on
 disk. Here the log *is* derived from what was written.
 
-Concurrency: recordings of one subject are computed by threads in a single
-process, and each subject has its own file, so an in-process lock is sufficient.
-No file locking is used, which keeps the behaviour identical on Linux, Windows
-and macOS.
+Concurrency: recordings are computed by joblib worker processes, so several
+recordings of one subject can append to that subject's file at the same moment,
+each from its own process and its own ``RecordingProgress``. Each entry is one
+short line appended in one write, so in practice it lands whole. Nothing locks
+the file across processes (no file locking, which keeps the behaviour identical
+on Linux, Windows and macOS); a line torn anyway is skipped when the file is
+read, so at worst a resumed run computes that recording again. The lock below
+only matters when threads of one process share one ``RecordingProgress``.
 """
 from __future__ import annotations
 
@@ -130,8 +134,8 @@ class RecordingProgress:
     def record(self, recording: str, status: str, errors: Iterable[Dict] = ()) -> None:
         """Append one recording's outcome and flush it to disk.
 
-        Called with the write lock already held by the caller in the pipeline,
-        but locks independently as well so the class is safe to use on its own.
+        The lock keeps threads that share this object from mixing their lines.
+        It does nothing between processes: see the module docstring.
         """
         entry = {
             "recording": recording_id(recording),

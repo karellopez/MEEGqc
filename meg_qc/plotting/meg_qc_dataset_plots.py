@@ -38,6 +38,7 @@ from meg_qc.plotting.reference_sources import (
 )
 from meg_qc.plotting.style_controls import (
     attach_distribution_style_controls as _attach_distribution_style_controls,
+    attach_matching_style_controls as _attach_matching_style_controls,
 )
 from plotly.utils import PlotlyJSONEncoder
 from plotly.subplots import make_subplots
@@ -2074,6 +2075,10 @@ def _figure_to_div(
     # ── Zone 3 (plot) occupies the remaining Plotly area ─────────────
 
     # Universal controls: axis-label sizing for all axis-bearing plots.
+    # Line and dot controls on every figure that has controls, as the subject
+    # report does; a figure that already has them keeps its own.
+    if include_plot_controls:
+        _attach_matching_style_controls(fig_out)
     if include_axis_size_control:
         _attach_axis_label_size_controller(fig_out)
     controls = _extract_figure_controls(fig_out) if include_plot_controls else []
@@ -7106,6 +7111,7 @@ def _build_report_html(
             }});
           }});
           applySummaryState(groupId, scope);
+          if (typeof __psRegisterSharedBar === 'function') {{ __psRegisterSharedBar(panel); }}
         }});
       }}
 

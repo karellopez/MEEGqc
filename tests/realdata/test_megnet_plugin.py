@@ -1,8 +1,8 @@
-"""MEGnet through its plugin (plugins/meegqc-megnet), on real recordings.
+"""MEGnet through its plugin (meg_qc/plugins/megnet), on real recordings.
 
 Skipped when the plugin is not installed: MEEGqc itself no longer depends on
 MEGnet. The testbench installs it in every environment
-(``meegqc-plugins install plugins/meegqc-megnet``).
+(the ``megnet`` extra: ``meegqc-plugins install megnet``).
 """
 from __future__ import annotations
 

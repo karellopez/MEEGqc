@@ -1,7 +1,8 @@
 """The MEGnet plugin without running MEGnet: which recordings it applies to,
 its settings, how it picks components, and how MEEGqc sees it.
 
-    pytest plugins/meegqc-megnet/tests
+It is part of MEEGqc (``meg_qc/plugins/megnet``); these tests need neither
+MEGnet's libraries nor test data.
 """
 from __future__ import annotations
 
@@ -9,9 +10,9 @@ import mne
 import numpy as np
 import pytest
 
-import meegqc_megnet
-from meegqc_megnet.applies import MIN_SECONDS, why_not
-from meegqc_megnet.run import compose_signal, pick_components
+import meg_qc.plugins.megnet as meegqc_megnet
+from meg_qc.plugins.megnet.applies import MIN_SECONDS, why_not
+from meg_qc.plugins.megnet.run import compose_signal, pick_components
 
 
 # ── which recordings ──────────────────────────────────────────────────────
@@ -103,7 +104,7 @@ def test_meegqc_loads_the_installed_plugin():
     from meg_qc.plugins.registry import discover
     found = {f.name: f for f in discover(refresh=True)}
     if "megnet" not in found:
-        pytest.skip("meegqc-megnet is importable but not installed (no entry point)")
+        pytest.skip("MEGnet's libraries (megnet-neuro) are not installed here")
     assert found["megnet"].plugin is not None, found["megnet"].error
 
 

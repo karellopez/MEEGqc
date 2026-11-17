@@ -9,8 +9,12 @@ This folder holds the plugins maintained with MEEGqc:
 
 | Folder | Package | What it adds |
 |---|---|---|
-| `meegqc-megnet/` | `meegqc-megnet` | MEGnet ECG/EOG references for MEG recordings. The complete example to copy from. |
 | `template/` | (not published) | The smallest working plugin, to start a new one. |
+
+MEGnet (ECG/EOG references for MEG recordings) is a plugin too, the complete
+example to read: it is part of MEEGqc itself, in `meg_qc/plugins/megnet/`, and
+only the libraries it needs are installed separately (the `megnet` extra). A
+plugin of your own is a separate package, like `template/`.
 
 ## What a plugin can do (plugin API 1)
 
@@ -106,7 +110,7 @@ only inside `compute`.
 8. **Heavy dependencies belong to the plugin**, never to MEEGqc. Name their
    size in the summary (MEGnet: "Installs PyTorch and Keras").
 9. **No global side effects at import.** Set environment variables or patch
-   libraries inside `compute`, once (see `meegqc_megnet/run.py`).
+   libraries inside `compute`, once (see `meg_qc/plugins/megnet/run.py`).
 
 ## Reference signals
 
@@ -147,7 +151,7 @@ how many recordings used it.
 
 - Unit tests in `tests/` that need neither MEEGqc's test data nor your heavy
   dependencies: what `applies_to` accepts and refuses, settings parsing, the
-  `Plugin` object (`plugins/meegqc-megnet/tests`).
+  `Plugin` object (MEGnet's: `tests/test_megnet_plugin_code.py`).
 - Real-data tests belong in MEEGqc's suite and skip when the plugin is not
   installed (`tests/realdata/test_megnet_plugin.py`).
 - MEEGqc's own `tests/realdata/test_plugin_reference.py` shows a fake provider

@@ -1,6 +1,5 @@
 import os
 import gc
-import threading
 import io
 import re
 import ancpbids

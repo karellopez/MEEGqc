@@ -62,15 +62,27 @@ Two paths. Pick the one that fits.
 
 ### Option A. One-click installer (recommended for end users)
 
-Download the platform installer bundle and double-click. The installer creates an isolated Python 3.10 environment at `~/MEEGqc/`, installs `meg-qc` into it, and registers a native app launcher (`MEEGqc.app` on macOS, `MEEGqc.desktop` on Linux, `MEEGqc.exe` on Windows).
+Download the installer bundle, unzip it and run the file for your system. It
+installs MEEGqc for the current user in `~/MEEGqc/` (`%USERPROFILE%\MEEGqc` on
+Windows), without administrator rights: a pinned copy of [uv](https://docs.astral.sh/uv/)
+checked against its published SHA-256, Python 3.10 downloaded by it, and an
+environment with `meg-qc` from PyPI. It adds `MEEGqc.app` to `~/Applications` on
+macOS, a menu entry on Linux, and Desktop and Start-menu shortcuts on Windows.
 
-[Download the installer bundle (zip, ~12 KB)](https://github.com/ANCPLabOldenburg/MEEGqc/raw/main/installers/installers.zip)
+[Download the installer bundle (zip, ~30 KB)](https://github.com/ANCPLabOldenburg/MEEGqc/raw/main/installers/installers.zip)
 
-| Platform        | Script inside the zip          | Default install dir |
-|-----------------|--------------------------------|---------------------|
-| macOS (arm64)   | `install_MEEGqc.command`       | `~/MEEGqc/`         |
-| Linux (x86_64)  | `install_MEEGqc.sh`            | `~/MEEGqc/`         |
-| Windows (x86_64)| `install_MEEGqc.bat`           | `~/MEEGqc/`         |
+| System | Script inside the zip | How to run it |
+|---|---|---|
+| macOS 11 or newer, Apple Silicon or Intel | `MacOS/install_MEEGqc.command` | Double-click it |
+| Linux, x86_64 or ARM64 | `Linux/install_MEEGqc.sh` | `bash install_MEEGqc.sh` |
+| Windows 10 or 11 (x64), Windows 11 on ARM | `Windows/install_MEEGqc.bat` | Double-click it |
+
+Running it again updates MEEGqc, or uninstalls it. MEEGqc's **Check updates**
+button updates an installation through the installer's own uv, and moves it to
+a newer Python when a release needs one, taking its plugins along. An
+installation made by an earlier installer (1.x) is converted in place the first
+time the new installer runs. Details, and options for testing and for
+administrators: [installers/README.md](https://github.com/ANCPLabOldenburg/MEEGqc/blob/main/installers/README.md).
 
 After install, launch with the native app (no terminal needed) or via the CLI commands described below.
 

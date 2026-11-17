@@ -85,6 +85,38 @@ def marker_restyle(fig: go.Figure, level: int, default_size: float = 8.0) -> lis
     return [{"marker.size": [size] * len(idx)}, idx]
 
 
+def current_line_width(fig: go.Figure, fallback: float = 2.0) -> float:
+    """The width of the first line the thickness control would change."""
+    for tr in fig.data:
+        if draws_line(tr):
+            width = _attr(tr, "line", "width")
+            if isinstance(width, (int, float)):
+                return float(width)
+    return fallback
+
+
+def current_marker_size(fig: go.Figure, fallback: float = 8.0) -> float:
+    """The size of the first dots the dot-size control would change."""
+    for tr in fig.data:
+        t, mode = _kind(tr)
+        if t in _SCATTER and "markers" in mode:
+            size = _attr(tr, "marker", "size")
+            if isinstance(size, (int, float)):
+                return float(size)
+    return fallback
+
+
+def attach_matching_style_controls(fig: go.Figure) -> None:
+    """The line and dot controls, highlighting the levels the figure is drawn
+    at. Every report figure that has controls gets them, as in the subject
+    report: a line plot without a thickness control ignores the report's Plot
+    settings (the dataset and QC reports' ECDFs and profiles did)."""
+    if fig is None or not getattr(fig, "data", None):
+        return
+    attach_distribution_style_controls(fig, default_line_width=current_line_width(fig),
+                                       default_marker_size=current_marker_size(fig))
+
+
 def attach_distribution_style_controls(
     fig: go.Figure,
     *,

@@ -64,7 +64,11 @@ def _info(name: str) -> int:
         print(f"{found.entry_point}: installed (package {found.package} "
               f"{found.package_version}) but not loaded: {found.error}")
     else:
-        print(f"{known.label} ({known.name}): not installed. Package {known.package}.")
+        if known.built_in:
+            print(f"{known.label} ({known.name}): part of MEEGqc, not installed yet: "
+                  f"it needs {', '.join(known.requirements)}.")
+        else:
+            print(f"{known.label} ({known.name}): not installed. Package {known.package}.")
         print(known.summary)
         if known.homepage:
             print(known.homepage)

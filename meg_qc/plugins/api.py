@@ -20,7 +20,7 @@ What version 1 offers:
   derivatives, named after the plugin, and the reports show them.
 
 See ``plugins/README.md`` in the MEEGqc repository for the guidelines and
-``plugins/meegqc-megnet`` for a complete plugin.
+``meg_qc/plugins/megnet`` for a complete plugin.
 """
 from __future__ import annotations
 

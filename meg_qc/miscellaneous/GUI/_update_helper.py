@@ -2,34 +2,116 @@
 
 This script is copied to a temp directory by ``updater.launch_update_helper``
 before it is spawned, so it does not depend on the installed
-``meg_qc.miscellaneous.GUI`` package files staying intact during the pip
-install (which is exactly what would be a problem on Windows: a running
-Python process holds open handles on its loaded ``.dll`` / ``.pyd``
-files, and pip cannot replace them in-place).
+``meg_qc.miscellaneous.GUI`` package files staying intact during the update
+(which is exactly what would be a problem on Windows: a running Python
+process holds open handles on its loaded ``.dll`` / ``.pyd`` files). It uses
+the standard library only.
 
 Lifecycle::
 
     1. wait for --parent-pid to terminate
-    2. pip install --upgrade <package>
+    2. install the update:
+       - with --installation, through the uv the installer recorded,
+         with the installer's settings, then bring the record up to date;
+         --move-to-python first rebuilds the environment on that Python,
+         installs the plugins the old one held, and puts the previous one
+         back if anything else fails;
+       - otherwise ``python -m pip install --upgrade <package>``
     3. optionally re-launch the GUI via --restart-cmd
 
-Output is whatever ``pip`` prints. On Windows the helper runs in its
-own console window so the user sees pip's progress; on POSIX the
-launcher redirects it to ``~/.meg_qc/update.log``.
+On Windows the helper runs in its own console window so the user sees the
+progress; on POSIX the launcher redirects it to a log file.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import os
 import platform
+import re
+import shutil
 import subprocess
-import sys
 import time
+from pathlib import Path
 
 
 PARENT_WAIT_TIMEOUT_S = 90.0  # how long we'll wait for the GUI to exit
 PARENT_POLL_INTERVAL_S = 0.5
+RENAME_RETRY_S = 10.0  # Windows: a virus scanner may hold a file for a moment
+
+# The installer's build (uv's target triple) -> uv's name for a Python of it.
+_PYTHON_PLATFORMS = {
+    "aarch64-apple-darwin": "macos-aarch64-none",
+    "x86_64-apple-darwin": "macos-x86_64-none",
+    "x86_64-unknown-linux-gnu": "linux-x86_64-gnu",
+    "aarch64-unknown-linux-gnu": "linux-aarch64-gnu",
+    "x86_64-pc-windows-msvc": "windows-x86_64-none",
+}
+
+# Variables that would point the installer's uv or the new environment
+# somewhere else.
+_FOREIGN = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME", "PYTHONPATH")
+
+# Run by an environment's own Python: the plugins installed in it, one
+# requirement per line, enough to install each again into a new environment
+# (from PyPI by name, or from the folder, archive or repository it came
+# from; for a plugin that is part of MEEGqc, the libraries it needs). The installers run this very code before they rebuild an
+# environment; tests/test_installers.py keeps the copies identical.
+PLUGIN_SPECS_CODE = '''\
+import json
+import re
+from importlib.metadata import PackageNotFoundError, distribution, entry_points
+from urllib.parse import urlparse
+from urllib.request import url2pathname
+
+specs = {}
+for point in entry_points(group="meegqc.plugins"):
+    dist = getattr(point, "dist", None)
+    if dist is None:
+        continue
+    name = dist.metadata["Name"]
+    if name == "meegqc-megnet":
+        continue  # MEGnet is part of MEEGqc now: its libraries follow below
+    try:
+        origin = json.loads(dist.read_text("direct_url.json") or "{}")
+    except ValueError:
+        origin = {}
+    url = origin.get("url", "")
+    vcs = origin.get("vcs_info")
+    if not url:
+        specs[name] = name
+    elif vcs:
+        specs[name] = "%s @ %s+%s@%s" % (name, vcs["vcs"], url, vcs.get("commit_id", ""))
+    elif origin.get("dir_info", {}).get("editable"):
+        specs[name] = "-e " + url2pathname(urlparse(url).path)
+    else:
+        specs[name] = "%s @ %s" % (name, url)
+
+# A plugin that is part of MEEGqc (MEGnet) is one of its extras: the
+# libraries of every extra whose libraries are all installed.
+try:
+    required = distribution("meg_qc").requires or []
+except PackageNotFoundError:
+    required = []
+extras = {}
+for line in required:
+    requirement, _, marker = line.partition(";")
+    found = re.search("extra *== *.([A-Za-z0-9_.-]+)", marker)
+    if found:
+        extras.setdefault(found.group(1), []).append(requirement.strip())
+for requirements in extras.values():
+    try:
+        for requirement in requirements:
+            distribution(re.match("[A-Za-z0-9._-]+", requirement).group(0))
+    except PackageNotFoundError:
+        continue
+    for requirement in requirements:
+        specs[requirement] = requirement
+for spec in sorted(specs.values()):
+    print(spec)
+'''
 
 
 def _wait_for_parent_posix(pid: int, timeout_s: float) -> bool:
@@ -51,13 +133,17 @@ def _wait_for_parent_windows(pid: int, timeout_s: float) -> bool:
 
     SYNCHRONIZE = 0x00100000
     WAIT_OBJECT_0 = 0
-    WAIT_TIMEOUT = 0x102
+    # Not used, and kept on purpose: it is the OTHER value
+    # WaitForSingleObject returns, so the pair is what makes the
+    # `result == WAIT_OBJECT_0` below legible as "exited" rather than
+    # "timed out".
+    WAIT_TIMEOUT = 0x102  # noqa: F841
 
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
     if not handle:
         # Couldn't open it. Either it's already gone, or we lack
-        # permission. Either way pip won't be blocked by it.
+        # permission. Either way the update won't be blocked by it.
         return True
     try:
         result = kernel32.WaitForSingleObject(handle, int(timeout_s * 1000))
@@ -90,6 +176,217 @@ def run_pip_upgrade(python: str, package: str) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# Installer installations: the recorded uv
+# ---------------------------------------------------------------------------
+
+
+def uv_environment(record: dict, base: dict) -> dict:
+    """``base`` without anything meant for another uv or environment,
+    plus the settings the installer ran its uv with."""
+    env = {key: value for key, value in base.items()
+           if not key.startswith("UV_") and key not in _FOREIGN}
+    env.update({key: str(value) for key, value in (record.get("uv_environment") or {}).items()})
+    return env
+
+
+def run_uv(record: dict, args: list) -> int:
+    """Run the recorded uv; once more with the system's certificates if
+    it fails, which networks that inspect HTTPS need (as the installer does)."""
+    uv = record["uv"]["executable"]
+    env = uv_environment(record, dict(os.environ))
+    print(f"[update] running: uv {' '.join(str(a) for a in args)}", flush=True)
+    try:
+        rc = subprocess.run([uv, *args], env=env, check=False).returncode
+        if rc != 0:
+            print("[update] trying again with the system's certificates", flush=True)
+            rc = subprocess.run([uv, *args], env={**env, "UV_SYSTEM_CERTS": "1"},
+                                check=False).returncode
+        return rc
+    except Exception as exc:
+        print(f"[update] uv could not run: {exc}", flush=True)
+        return 1
+
+
+def python_request(record: dict, version: str) -> str:
+    """uv's name for Python ``version`` built for this installation's
+    platform (``cpython-3.13-macos-aarch64-none``), so a move keeps the
+    build the installer chose (Windows on ARM stays on x64)."""
+    target = (record.get("installer") or {}).get("target", "")
+    suffix = _PYTHON_PLATFORMS.get(target)
+    return f"cpython-{version}-{suffix}" if suffix else version
+
+
+def installed_pythons(record: dict) -> set:
+    """uv's names for the Pythons in the install folder, one per minor
+    version and build (``cpython-3.13-macos-aarch64-none``)."""
+    root = (record.get("uv_environment") or {}).get("UV_PYTHON_INSTALL_DIR")
+    found = set()
+    if root:
+        for entry in Path(root).glob("cpython-*"):
+            match = re.fullmatch(r"cpython-(\d+\.\d+)\.\d+[^-]*-(.+)", entry.name)
+            if match:
+                found.add(f"cpython-{match.group(1)}-{match.group(2)}")
+    return found
+
+
+def remove_pythons(record: dict, requests) -> None:
+    """Remove Pythons no environment uses any more, best effort: each is
+    about 70 MB. On Windows the one this helper runs on cannot be removed
+    while it runs, so it stays until the next move."""
+    uv = record["uv"]["executable"]
+    env = uv_environment(record, dict(os.environ))
+    for request in sorted(requests):
+        try:
+            rc = subprocess.run([uv, "python", "uninstall", request], env=env,
+                                check=False).returncode
+        except Exception:
+            rc = 1
+        if rc != 0:
+            print(f"[update] {request} is kept (in use, or could not be removed).", flush=True)
+
+
+def upgrade_with_uv(record: dict, python: str, package: str) -> int:
+    return run_uv(record, ["pip", "install", "--upgrade", "--compile-bytecode",
+                           "--python", python, package])
+
+
+def plugin_specs(python: str) -> list:
+    """The plugins installed in the environment of ``python``, as
+    requirements (see ``PLUGIN_SPECS_CODE``); empty when it cannot tell."""
+    try:
+        out = subprocess.run([python, "-I", "-c", PLUGIN_SPECS_CODE],
+                             capture_output=True, text=True, check=False)
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def install_plugins(record: dict, python: str, specs) -> list:
+    """Install each plugin requirement into ``python``'s environment. A
+    plugin that cannot be installed is reported and returned, never fatal:
+    MEEGqc runs without it, and the Plugins window can add it later."""
+    failed = []
+    for spec in specs:
+        args = ["-e", spec[3:]] if spec.startswith("-e ") else [spec]
+        if run_uv(record, ["pip", "install", "--compile-bytecode",
+                           "--python", python, *args]) == 0:
+            print(f"[update] plugin installed again: {spec}", flush=True)
+        else:
+            print(f"[update] the plugin {spec} could not be installed again; "
+                  "add it in MEEGqc's Plugins window.", flush=True)
+            failed.append(spec)
+    return failed
+
+
+def _rename(src: Path, dst: Path) -> None:
+    """``src.rename(dst)``, retried for a few seconds on Windows, where a
+    virus scanner can hold a file the moment after a program closes it."""
+    deadline = time.time() + (RENAME_RETRY_S if platform.system() == "Windows" else 0)
+    while True:
+        try:
+            src.rename(dst)
+            return
+        except OSError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.5)
+
+
+def _starts(python: str) -> bool:
+    try:
+        return subprocess.run([python, "-I", "-c", "import meg_qc, PyQt6.QtWidgets"],
+                              check=False).returncode == 0
+    except Exception:
+        return False
+
+
+def move_to_python(record: dict, version: str, python: str, package: str) -> int:
+    """Rebuild the environment on Python ``version`` and install the
+    package into it, then the plugins the old environment held. The
+    previous environment is set aside first and put back if any step
+    but the plugins fails, so a failed move leaves MEEGqc as it was."""
+    env_dir = Path(record["environment"])
+    request = python_request(record, version)
+    already_there = request in installed_pythons(record)
+    install = ["python", "install", request, "--no-bin"]
+    if platform.system() == "Windows":
+        install.append("--no-registry")
+    if run_uv(record, install) != 0:
+        print(f"[update] Python {version} could not be installed.", flush=True)
+        return 1
+
+    plugins = plugin_specs(python)
+    previous = env_dir.with_name(env_dir.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous)
+    _rename(env_dir, previous)
+    ok = (run_uv(record, ["venv", "--seed", "--prompt", "MEEGqc",
+                          "--python", request, str(env_dir)]) == 0
+          and upgrade_with_uv(record, python, package) == 0
+          and _starts(python))
+    if ok:
+        install_plugins(record, python, plugins)
+        shutil.rmtree(previous, ignore_errors=True)
+        print(f"[update] moved to Python {version}.", flush=True)
+        return 0
+    print("[update] the move did not complete; putting the previous environment back.",
+          flush=True)
+    shutil.rmtree(env_dir, ignore_errors=True)
+    _rename(previous, env_dir)
+    if not already_there:
+        remove_pythons(record, {request})
+    return 1
+
+
+def record_update(manifest: Path, record: dict, python: str, moved_to: str = "") -> None:
+    """Bring ``installation.json`` up to date with what is now installed."""
+    try:
+        out = subprocess.run(
+            [python, "-I", "-c",
+             "import json, platform; from importlib.metadata import version; "
+             "print(json.dumps([version('meg_qc'), platform.python_version()]))"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        package_version, python_version = json.loads(out.strip().splitlines()[-1])
+    except Exception as exc:
+        print(f"[update] could not read the installed versions: {exc}", flush=True)
+        return
+    record.setdefault("package", {})["version"] = package_version
+    record.setdefault("python", {})["version"] = python_version
+    if moved_to:
+        # The mark tells the installer this Python was needed by a release,
+        # so running it again keeps the environment rather than rebuilding
+        # it on the installer's older default.
+        record["python"]["requested"] = moved_to
+        record["python"]["moved_by_update"] = True
+    record["updated"] = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat()
+    try:
+        manifest.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[update] could not update {manifest.name}: {exc}", flush=True)
+
+
+def update_installation(manifest: Path, python: str, package: str, move_to: str) -> int:
+    """The update of an installer installation, through its own uv."""
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    if move_to:
+        rc = move_to_python(record, move_to, python, package)
+    else:
+        rc = upgrade_with_uv(record, python, package)
+    if rc == 0:
+        record_update(manifest, record, python, move_to)
+        if move_to:
+            # Last, because on macOS and Linux this may remove the very
+            # Python this helper runs on (harmless once nothing more is
+            # loaded from it).
+            remove_pythons(record, installed_pythons(record) - {python_request(record, move_to)})
+    return rc
+
+
 def restart_gui(restart_cmd: str) -> None:
     """Re-launch the GUI in a detached process and exit the helper."""
     if not restart_cmd:
@@ -117,19 +414,24 @@ def restart_gui(restart_cmd: str) -> None:
         print(f"[update] could not relaunch GUI: {exc}", flush=True)
 
 
-def _pause_console_on_windows() -> None:
-    """On Windows we run in a CREATE_NEW_CONSOLE, so pause so the user
-    can read the output before the window auto-closes.
-    """
-    if platform.system() != "Windows":
-        return
-    try:
-        input("\nPress Enter to close this window...")
-    except Exception:
-        pass
+def _remove_own_copy() -> None:
+    """The copy of this script in its temporary folder is of no use once the
+    update has run: remove that folder (``meg_qc-update-*``), never another.
+    Python has read the whole script before running it, so this works on
+    Windows too."""
+    folder = Path(__file__).resolve().parent
+    if folder.name.startswith("meg_qc-update-"):
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def main() -> int:
+    try:
+        return _run()
+    finally:
+        _remove_own_copy()
+
+
+def _run() -> int:
     parser = argparse.ArgumentParser(prog="meg_qc-update-helper")
     parser.add_argument("--parent-pid", type=int, required=True)
     parser.add_argument("--python", required=True,
@@ -138,6 +440,11 @@ def main() -> int:
                         help="PyPI distribution name to upgrade. "
                              "Set to 'meeg_qc' if the user installed via "
                              "the meeg-qc wrapper.")
+    parser.add_argument("--installation", default="",
+                        help="The installer's installation.json: update through its uv.")
+    parser.add_argument("--move-to-python", default="",
+                        help="With --installation: rebuild the environment on this "
+                             "Python (for example 3.13) before updating.")
     parser.add_argument("--restart-cmd", default="",
                         help="GUI entry point to relaunch after upgrade. "
                              "Empty disables restart.")
@@ -148,7 +455,7 @@ def main() -> int:
     if not wait_for_parent(args.parent_pid):
         print(
             f"[update] timed out after {PARENT_WAIT_TIMEOUT_S:.0f}s; "
-            "the GUI is still running, aborting pip install.",
+            "the GUI is still running, aborting the update.",
             flush=True,
         )
         _pause_console_on_windows()
@@ -158,9 +465,17 @@ def main() -> int:
     # behalf.
     time.sleep(0.5)
 
-    rc = run_pip_upgrade(args.python, args.package)
+    if args.installation:
+        try:
+            rc = update_installation(Path(args.installation), args.python,
+                                     args.package, args.move_to_python)
+        except Exception as exc:
+            print(f"[update] the update could not run: {exc}", flush=True)
+            rc = 1
+    else:
+        rc = run_pip_upgrade(args.python, args.package)
     if rc != 0:
-        print(f"[update] pip exited with code {rc}.", flush=True)
+        print(f"[update] the update exited with code {rc}.", flush=True)
         _pause_console_on_windows()
         return rc
 
@@ -170,6 +485,18 @@ def main() -> int:
     else:
         _pause_console_on_windows()
     return 0
+
+
+def _pause_console_on_windows() -> None:
+    """On Windows we run in a CREATE_NEW_CONSOLE, so pause so the user
+    can read the output before the window auto-closes.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        input("\nPress Enter to close this window...")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

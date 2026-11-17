@@ -3744,9 +3744,40 @@ class MainWindow(QMainWindow):
         self.workers[key] = worker
 
 
+#: What Qt's macOS accessibility bridge prints when a program that reads
+#: windows (a screen reader, a window or menu-bar manager, a desktop AI app
+#: that "works with apps") asks about a widget Qt has already deleted, such as
+#: a tooltip that has faded: "Called attribute on invalid object:  2147484176".
+#: Nothing is wrong and nothing in MEEGqc can prevent it; it only floods the
+#: terminal, one line per question.
+_STALE_ACCESSIBILITY_MESSAGE = re.compile(r"^Called \w+ on invalid object\b")
+
+
+def _qt_message(mode, context, message: str) -> None:
+    """Qt's messages as Qt prints them, without the stale-accessibility one."""
+    if _STALE_ACCESSIBILITY_MESSAGE.match(message or ""):
+        return
+    category = getattr(context, "category", None) or "default"
+    prefix = "" if category == "default" else f"{category}: "
+    try:
+        sys.stderr.write(f"{prefix}{message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _quiet_stale_accessibility_messages() -> None:
+    """macOS only: drop that one message, pass every other on unchanged."""
+    if sys.platform != "darwin":
+        return
+    from PyQt6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(_qt_message)
+
+
 def run_megqc_gui():
     """Entry point called by the ``megqc`` / ``meegqc`` console scripts."""
     _ensure_xcb_cursor()  # no-op on non-Linux; auto-fixes missing libxcb-cursor0
+    _quiet_stale_accessibility_messages()
     from PyQt6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication(sys.argv)
     _use_c_time_locale()

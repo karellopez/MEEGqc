@@ -1,6 +1,9 @@
 """Finding the installed plugins.
 
-A plugin that cannot be loaded (an import error, a wrong API version, a bad
+Plugins come from two places: those part of MEEGqc itself (the catalog's
+built-in entries, such as MEGnet), loaded once the libraries they need are
+installed, and separate packages, found through the ``meegqc.plugins`` entry
+point. A plugin that cannot be loaded (an import error, a wrong API version, a bad
 name) is listed with the reason and otherwise ignored: a broken plugin never
 stops MEEGqc. Set ``MEEGQC_PLUGINS=0`` to load none at all, for example to
 check whether a problem comes from a plugin.
@@ -8,6 +11,7 @@ check whether a problem comes from a plugin.
 from __future__ import annotations
 
 import configparser
+import importlib
 import os
 from dataclasses import dataclass
 from importlib import metadata
@@ -20,6 +24,7 @@ from meg_qc.plugins.api import (
     RESERVED_NAMES,
     Plugin,
 )
+from meg_qc.plugins.catalog import CATALOG, SUPERSEDED, CatalogEntry, entry, requirements_installed
 
 
 @dataclass(frozen=True)
@@ -48,12 +53,32 @@ def _load(ep) -> FoundPlugin:
     dist = getattr(ep, "dist", None)
     package = dist.metadata["Name"] if dist is not None else "?"
     package_version = dist.version if dist is not None else "?"
+    included = SUPERSEDED.get(package)
+    if included:
+        label = entry(included).label if entry(included) else included
+        return FoundPlugin(ep.name, package, package_version, None, (
+            f"MEEGqc now includes {label}, so this separate package is no longer "
+            f"used; remove it with: meegqc-plugins remove {package}"))
+    return _made(ep.name, package, package_version, ep.load)
 
+
+def _load_built_in(item: CatalogEntry) -> FoundPlugin:
+    """A plugin that is part of MEEGqc, listed under the library it needs."""
+    try:
+        package_version = metadata.version(item.package)
+    except metadata.PackageNotFoundError:
+        package_version = "?"
+    module, _, attr = item.module.partition(":")
+    return _made(item.name, item.package, package_version,
+                 lambda: getattr(importlib.import_module(module), attr))
+
+
+def _made(entry_point: str, package: str, package_version: str, load) -> FoundPlugin:
     def found(plugin=None, error=""):
-        return FoundPlugin(ep.name, package, package_version, plugin, error)
+        return FoundPlugin(entry_point, package, package_version, plugin, error)
 
     try:
-        factory = ep.load()
+        factory = load()
         plugin = factory()
     except Exception as exc:  # a plugin's own bug must not stop MEEGqc
         return found(error=f"could not be loaded: {type(exc).__name__}: {exc}")
@@ -80,7 +105,11 @@ def discover(refresh: bool = False) -> List[FoundPlugin]:
     if _disabled():
         _FOUND = []
         return _FOUND
-    found = [_load(ep) for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)]
+    # Built-in plugins first, so that they keep their name when a separate
+    # package claims it too.
+    found = [_load_built_in(item) for item in CATALOG
+             if item.built_in and requirements_installed(item)]
+    found += [_load(ep) for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)]
     names = set()
     unique = []
     for item in sorted(found, key=lambda f: f.name):

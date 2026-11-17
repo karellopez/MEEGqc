@@ -60,7 +60,7 @@ def test_the_dialog_lists_installed_broken_and_installable_plugins(qapp, fake_pl
         texts = _texts(d)
         assert "FakeRef" in texts and "Installed, version 2.0" in texts
         assert any("but not loaded: could not be loaded: oops" in t for t in texts)
-        assert "MEGnet" in texts and "Not installed (package meegqc-megnet)" in texts
+        assert "MEGnet" in texts and "Not installed (package megnet-neuro)" in texts
         assert any("[FAKEREF] section" in t for t in texts)
     finally:
         d.close()

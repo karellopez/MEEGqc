@@ -8,8 +8,8 @@ supported Python, through the CLI AND the GUI, with screenshots to look at.
     python testbench.py status [--root DIR]
 
 ``setup`` builds (or refreshes) the folder, installing the newest versions
-MEEGqc allows (``--upgrade``, as a new user gets) plus the MEGnet plugin from
-the repository, so its tests run:
+MEEGqc allows (``--upgrade``, as a new user gets) plus the libraries of the
+MEGnet plugin (the ``megnet`` extra), so its tests run:
 
     <root>/MEEGqc/                    a git clone of the repo under test
     <root>/envs/py310 .. py314/       one uv environment per Python (no admin)
@@ -192,10 +192,11 @@ def setup(a) -> None:
             # The default Linux torch wheel brings several GB of CUDA libraries.
             run([uv, "pip", "install", "--python", str(envpy), "--upgrade", "torch",
                  "--index-url", "https://download.pytorch.org/whl/cpu"])
-        run([uv, "pip", "install", "--python", str(envpy), "--upgrade", "-e", str(repo), "pytest"])
-        plugin = repo / "plugins" / "meegqc-megnet"
-        if plugin.is_dir():
-            run([uv, "pip", "install", "--python", str(envpy), "--upgrade", "-e", str(plugin)])
+        # MEGnet is part of MEEGqc; its libraries are the "megnet" extra. The
+        # separate package it once was is removed where an earlier setup left it.
+        run([uv, "pip", "install", "--python", str(envpy), "--upgrade",
+             "-e", f"{repo}[megnet]", "pytest"])
+        run([uv, "pip", "uninstall", "--python", str(envpy), "meegqc-megnet"], check=False)
     setup_bundle(root, a.bundle)
     write_full_data(root)
     write_vscode(root, a.pythons)

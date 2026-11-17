@@ -38,6 +38,7 @@ from meg_qc.plotting.reference_sources import (
 )
 from meg_qc.plotting.style_controls import (
     attach_distribution_style_controls as _attach_distribution_style_controls,
+    attach_matching_style_controls as _attach_matching_style_controls,
 )
 from plotly.utils import PlotlyJSONEncoder
 
@@ -1790,6 +1791,9 @@ def _summary_distribution_dataset_grid_html(
     return (
         f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
         + "".join(cards) + "</div>"
+        # The same shared bar as every other summary grid, so these plots have
+        # controls and follow the report's Plot settings.
+        + _summary_shared_controls_panel_html(summary_group_id)
         + "<div class='summary-shared-note'><strong>How to interpret:</strong> "
         "Each panel is one QC metric and <strong>one dot is one dataset</strong>: the mean over "
         "all of that dataset's recording-level values. Hover shows the dataset id, its recording "
@@ -2405,6 +2409,10 @@ def _figure_to_div(
 
     # ── Zone 2 (legend) stays inside the Plotly figure at y>1 ────────
     # ── Zone 3 (plot) occupies the remaining Plotly area ─────────────
+    # Line and dot controls on every figure that has controls, as the subject
+    # report does; a figure that already has them keeps its own.
+    if include_plot_controls:
+        _attach_matching_style_controls(fig_out)
     if include_axis_size_control:
         _attach_axis_label_size_controller(fig_out)
     controls = _extract_figure_controls(fig_out) if include_plot_controls else []
@@ -3488,6 +3496,7 @@ def _build_report_html(
             }});
           }});
           applySummaryState(groupId);
+          if (typeof __psRegisterSharedBar === 'function') {{ __psRegisterSharedBar(panel); }}
         }});
       }}
 

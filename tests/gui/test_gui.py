@@ -404,3 +404,41 @@ def test_the_gui_keeps_dates_readable_whatever_the_system_language(main_window):
     import time
     assert locale.setlocale(locale.LC_TIME) == "C"
     assert time.strptime("01-Jan-1925", "%d-%b-%Y").tm_year == 1925
+
+
+# ── macOS: the stale-accessibility message ─────────────────────────────────
+
+@pytest.mark.parametrize(("message", "shown"), [
+    ("Called attribute on invalid object:  2147484176", False),
+    ("Called accessibilityRole on invalid object:  2147484185", False),
+    ("Called attribute on a valid object", True),
+    ("QWindowsWindow::setGeometry: Unable to set geometry", True),
+    ("Some message about an invalid object", True),
+])
+def test_only_the_stale_accessibility_message_is_dropped(message, shown, capsys):
+    """Programs that read windows (screen readers, window or menu-bar
+    managers, desktop AI apps) ask Qt about widgets it has already deleted,
+    such as a faded tooltip, and Qt prints one line per question. The user's
+    terminal filled with them (2026-11-16); every other message must still
+    reach it, with Qt's category prefix."""
+    from types import SimpleNamespace
+    from meg_qc.miscellaneous.GUI import megqcGUI
+
+    megqcGUI._qt_message(None, SimpleNamespace(category="default"), message)
+    assert (capsys.readouterr().err == message + "\n") is shown
+    megqcGUI._qt_message(None, SimpleNamespace(category="qt.qpa.window"), "geometry")
+    assert capsys.readouterr().err == "qt.qpa.window: geometry\n"
+
+
+def test_the_message_filter_is_installed_on_macos_only(monkeypatch):
+    from meg_qc.miscellaneous.GUI import megqcGUI
+    import PyQt6.QtCore as qtcore
+
+    installed = []
+    monkeypatch.setattr(qtcore, "qInstallMessageHandler", lambda h: installed.append(h))
+    monkeypatch.setattr(megqcGUI.sys, "platform", "linux")
+    megqcGUI._quiet_stale_accessibility_messages()
+    assert installed == []
+    monkeypatch.setattr(megqcGUI.sys, "platform", "darwin")
+    megqcGUI._quiet_stale_accessibility_messages()
+    assert installed == [megqcGUI._qt_message]

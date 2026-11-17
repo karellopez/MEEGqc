@@ -47,8 +47,9 @@ dependencies = [
     # MNE 1.13 needs Python 3.11, and Python 3.10 cannot install that SciPy.
     "mne>=1.6,<=1.12.1; python_version < '3.11'",
     "mne>=1.13.1,<=1.13.2; python_version >= '3.11'",
-    # MEGnet is an optional plugin (plugins/meegqc-megnet), installed with
-    # `meegqc-plugins install megnet`; it brings PyTorch and Keras.
+    # MEGnet is part of MEEGqc (meg_qc/plugins/megnet) but its libraries are
+    # optional: the "megnet" extra below, installed with `meegqc-plugins
+    # install megnet`, the GUI's Plugins window or `pip install meg_qc[megnet]`.
     "pandas>=2.0,<=3.0.2",
     "plotly>=5.18,<=6.7.0",
     "joblib>=1.3,<=1.5.3",
@@ -59,6 +60,12 @@ dependencies = [
     "pyqtgraph>=0.13,<=0.14.0",
     "numba>=0.58,<=0.65.0",
 ]
+
+[project.optional-dependencies]
+# Kept equal to the MEGnet entry of meg_qc/plugins/catalog.py (a test checks).
+# megnet-neuro brings PyTorch and Keras. 0.3.6: older releases need
+# TensorFlow and do not import with MNE 1.13.
+megnet = ["megnet-neuro>=0.3.6"]
 
 [project.urls]
 Homepage = "https://github.com/ANCPLabOldenburg/MEEGqc"
@@ -93,6 +100,7 @@ include-package-data = true
     "assets/macos/AppIcon1024.png",
     "assets/windows/AppIcon.ico",
 ]
+"meg_qc.plugins.megnet" = ["settings.ini", "README.md"]
 
 [tool.setuptools.packages.find]
 include = ["meg_qc*"]

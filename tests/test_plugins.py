@@ -6,6 +6,7 @@ any plugin installed (and with MEGnet installed, which these tests ignore).
 from __future__ import annotations
 
 import configparser
+import re
 import sys
 from types import SimpleNamespace
 
@@ -59,10 +60,13 @@ class FakeEntryPoint:
 
 @pytest.fixture
 def installed(monkeypatch):
-    """Install fake entry points; returns a function taking (name, factory) pairs."""
-    def _install(*eps):
+    """Install fake entry points; returns a function taking (name, factory) pairs.
+    The plugins that are part of MEEGqc (MEGnet) count as not installed unless
+    ``built_in=True``, whatever this environment has."""
+    def _install(*eps, built_in=False):
         monkeypatch.setattr(registry.metadata, "entry_points",
                             lambda group=None: [FakeEntryPoint(n, f) for n, f in eps])
+        monkeypatch.setattr(registry, "requirements_installed", lambda item: built_in)
         registry.discover(refresh=True)
     monkeypatch.delenv("MEEGQC_PLUGINS", raising=False)
     yield _install
@@ -213,17 +217,20 @@ def test_a_reference_nobody_asked_for_is_not_computed(installed, monkeypatch):
 # ── installing ────────────────────────────────────────────────────────────
 
 def test_a_catalog_name_installs_its_package():
-    assert manage.resolve_spec("megnet") == "meegqc-megnet"
-    assert manage.resolve_spec("./my-plugin") == "./my-plugin"
+    """MEGnet is part of MEEGqc: installing it installs what it needs."""
+    assert manage.resolve_spec("megnet") == ["megnet-neuro>=0.3.6"]
+    assert manage.resolve_spec("./my-plugin") == ["./my-plugin"]
 
 
 def test_pip_is_used_when_the_environment_has_it(monkeypatch):
+    monkeypatch.setattr(manage, "_installation", lambda: None)
     monkeypatch.setattr(manage, "_has_pip", lambda: True)
     assert manage.installer_command("install", "pkg") == [sys.executable, "-m", "pip", "install", "pkg"]
     assert manage.installer_command("uninstall", "pkg")[-2:] == ["-y", "pkg"]
 
 
 def test_uv_installs_into_this_python_when_there_is_no_pip(monkeypatch):
+    monkeypatch.setattr(manage, "_installation", lambda: None)
     monkeypatch.setattr(manage, "_has_pip", lambda: False)
     monkeypatch.setattr(manage, "_uv", lambda: "/bin/uv")
     assert manage.installer_command("install", "pkg", upgrade=True) == [
@@ -231,10 +238,68 @@ def test_uv_installs_into_this_python_when_there_is_no_pip(monkeypatch):
 
 
 def test_without_pip_or_uv_the_reason_is_given(monkeypatch):
+    monkeypatch.setattr(manage, "_installation", lambda: None)
     monkeypatch.setattr(manage, "_has_pip", lambda: False)
     monkeypatch.setattr(manage, "_uv", lambda: None)
     with pytest.raises(manage.InstallError, match="neither pip nor uv"):
         manage.installer_command("install", "pkg")
+
+
+def _installer_installation(tmp_path, monkeypatch):
+    """An installation made by the MEEGqc installer, around this Python."""
+    import json
+    from meg_qc.miscellaneous.GUI import updater
+
+    uv = tmp_path / "MEEGqc" / "uv" / "uv"
+    uv.parent.mkdir(parents=True)
+    uv.write_text("")
+    manifest = tmp_path / "MEEGqc" / "installation.json"
+    manifest.write_text(json.dumps({
+        "environment": sys.prefix,
+        "uv": {"version": "0.13.1", "executable": str(uv)},
+        "uv_environment": {"UV_NO_CONFIG": "1", "UV_CACHE_DIR": "/install/cache"},
+    }), encoding="utf-8")
+    installation = updater.Installation(manifest=manifest, uv=uv)
+    monkeypatch.setattr(manage, "_installation", lambda: installation)
+    # Pip is there (the installer seeds it) and must not be what runs.
+    monkeypatch.setattr(manage, "_has_pip", lambda: True)
+    return installation
+
+
+def test_an_installer_installation_installs_plugins_through_its_own_uv(tmp_path, monkeypatch):
+    """As its updates do: nothing lands outside the install folder, and the
+    user's pip or uv settings do not apply."""
+    installation = _installer_installation(tmp_path, monkeypatch)
+    assert manage.installer_command("install", "pkg", upgrade=True) == [
+        str(installation.uv), "pip", "install", "--python", sys.executable,
+        "--compile-bytecode", "--upgrade", "pkg"]
+    assert manage.installer_command("uninstall", "pkg") == [
+        str(installation.uv), "pip", "uninstall", "--python", sys.executable, "pkg"]
+
+
+def test_the_installers_uv_runs_with_the_installers_settings(tmp_path, monkeypatch):
+    installation = _installer_installation(tmp_path, monkeypatch)
+    monkeypatch.setenv("UV_INDEX_URL", "http://elsewhere")
+    monkeypatch.setenv("UV_CACHE_DIR", "/mine")
+    calls = []
+
+    def stream(cmd, env, echo):
+        calls.append(env)
+        return 1   # fails: tried once more with the system's certificates
+
+    monkeypatch.setattr(manage, "_stream", stream)
+    cmd = manage.installer_command("install", "pkg")
+    assert manage.run(cmd, echo=lambda line: None) == 1
+    assert len(calls) == 2
+    for env in calls:
+        assert env["UV_CACHE_DIR"] == "/install/cache" and env["UV_NO_CONFIG"] == "1"
+        assert "UV_INDEX_URL" not in env
+    assert "UV_SYSTEM_CERTS" not in calls[0] and calls[1]["UV_SYSTEM_CERTS"] == "1"
+
+    calls.clear()
+    assert manage.run([str(installation.uv), "pip", "uninstall", "pkg"],
+                      echo=lambda line: None) == 1
+    assert len(calls) == 1, "removing is not a download: no second try"
 
 
 def test_the_cli_lists_installed_and_available_plugins(installed, capsys):
@@ -292,3 +357,67 @@ def test_the_runs_settings_copy_keeps_a_non_utf8_file_and_adds_the_plugin(instal
     _write_used_settings(str(src), str(dst))
     out = dst.read_bytes()
     assert out.startswith(original) and b"[FAKEREF]" in out
+
+
+# ── MEGnet, the plugin that is part of MEEGqc ─────────────────────────────
+
+def test_megnet_needs_exactly_what_the_megnet_extra_installs():
+    """``pip install meg_qc[megnet]`` and the Plugins window install the same."""
+    from pathlib import Path
+    from meg_qc.plugins.catalog import entry
+
+    text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    extra = re.search(r'^megnet = \[(.*?)\]', text, re.M | re.S).group(1)
+    assert tuple(re.findall(r'"([^"]+)"', extra)) == entry("megnet").requirements
+
+
+def test_megnet_loads_once_its_libraries_are_installed(installed):
+    installed(built_in=True)
+    (found,) = registry.discover()
+    assert found.plugin is not None, found.error
+    assert (found.name, found.package) == ("megnet", "megnet-neuro")
+    import meg_qc
+    assert found.plugin.version == meg_qc.__version__
+    installed(built_in=False)
+    assert registry.discover() == []
+
+
+def test_megnet_is_installed_and_removed_through_its_libraries(installed, monkeypatch):
+    monkeypatch.setattr(manage, "_installation", lambda: None)
+    monkeypatch.setattr(manage, "_has_pip", lambda: True)
+    assert manage.installer_command("install", manage.resolve_spec("megnet")) == [
+        sys.executable, "-m", "pip", "install", "megnet-neuro>=0.3.6"]
+    installed(built_in=True)
+    assert manage.package_of("megnet") == ["megnet-neuro"]
+    assert manage.package_of("megnet-neuro") == ["megnet-neuro"]
+    installed(built_in=False)
+    assert manage.package_of("megnet") == ["megnet-neuro"]
+
+
+def test_the_old_separate_megnet_package_is_explained_not_loaded(installed, monkeypatch):
+    """It was the plugin until MEEGqc included it; where it is still installed
+    it would claim the same name."""
+    class OldPackage(FakeEntryPoint):
+        def load(self):
+            raise AssertionError("must not be imported")
+
+    monkeypatch.setattr(registry.metadata, "entry_points",
+                        lambda group=None: [OldPackage("megnet", None, package="meegqc-megnet")])
+    monkeypatch.setattr(registry, "requirements_installed", lambda item: True)
+    found = registry.discover(refresh=True)
+    assert [f.plugin is not None for f in found] == [True, False]
+    assert found[0].package == "megnet-neuro"
+    assert "MEEGqc now includes MEGnet" in found[1].error
+    assert "meegqc-plugins remove meegqc-megnet" in found[1].error
+    assert manage.package_of("meegqc-megnet") == ["meegqc-megnet"]
+    registry._FOUND = None
+
+
+def test_megnet_code_imports_no_heavy_library_before_it_runs():
+    """Loading the plugin (what the registry does) imports neither MEGnet,
+    Keras nor PyTorch: only analysing a recording with it does."""
+    import subprocess
+    code = ("import sys; import meg_qc.plugins.megnet as m; m.plugin(); "
+            "print(sorted(n for n in ('MEGnet', 'keras', 'torch', 'tensorflow') if n in sys.modules))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
